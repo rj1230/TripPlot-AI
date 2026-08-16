@@ -1,0 +1,16 @@
+[project]
+name = "ai-travel-planning-system-using-langgraph"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "langchain-mcp-adapters>=0.3.2",
+]
+
+[project.scripts]
+ai-travel-planning-system-using-langgraph = "ai_travel_planning_system_using_langgraph:main"
+
+[build-system]
+requires = ["uv_build>=0.12.2,<0.13.0"]
+build-backend = "uv_build"
