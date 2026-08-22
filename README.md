@@ -2,7 +2,7 @@
 
 **Production-ready multi-agent travel planning system built with LangGraph + MCP — Supervisor Agent, Guardrails, and Human-in-the-Loop.**
 
-This project extends a basic multi-agent travel planner (Parts 1–2) into a production-pattern architecture: a **Supervisor Agent** orchestrates specialized sub-agents over **MCP (Model Context Protocol)** servers, with **Guardrails** validating every input/output and a **Human-in-the-Loop** checkpoint pausing execution before any consequential action is confirmed.
+This project extends a basic multi-agent travel planner into a production-pattern architecture: a **Supervisor Agent** orchestrates specialized sub-agents over **MCP (Model Context Protocol)** servers, with **Guardrails** validating every input/output and a **Human-in-the-Loop** checkpoint pausing execution before any consequential action is confirmed.
 
 ---
 
