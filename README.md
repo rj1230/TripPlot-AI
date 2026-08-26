@@ -74,3 +74,4 @@ Every agent response passes through a validation layer before reaching the Super
 ## 📄 License
 
 MIT
+# TripPlot-AI
