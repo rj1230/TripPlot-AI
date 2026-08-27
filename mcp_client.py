@@ -1,4 +1,6 @@
 import os
+import sys
+from pathlib import Path
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
@@ -7,6 +9,21 @@ from config import (
     OPENWEATHER_API_KEY,
     TAVILY_API_KEY,
 )
+
+# --------------------------------------------------------------
+# Resolve the local weather MCP server relative to THIS project,
+# instead of hardcoding a machine-specific absolute path (the old
+# "C:\Users\HP\OneDrive\Desktop\..." path only worked on one laptop
+# and breaks on any other machine, CI runner, or container).
+#
+# sys.executable is used for the interpreter so this also works
+# correctly inside whatever venv the project is actually launched
+# from, on Windows, macOS, or Linux.
+# --------------------------------------------------------------
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+WEATHER_SERVER_SCRIPT = PROJECT_ROOT / "weather_mcp_server.py"
+
 
 # Create MCP Client
 client = MultiServerMCPClient(
@@ -17,17 +34,29 @@ client = MultiServerMCPClient(
         },
         "aviationstack": {
             "transport": "stdio",
-            "command": r"C:\Users\HP\OneDrive\Desktop\AI Travel Planning System using LangGraph\aviationstack-mcp\.venv\Scripts\python.exe",
-            "args": ["-m", "aviationstack_mcp", "mcp", "run"],
-            "env": {"AVIATION_STACK_API_KEY": AVIATION_STACK_API_KEY},
+            # Uses uvx to run the published aviationstack-mcp package in its own
+            # isolated env. The package itself is pinned to the mcp v1 API
+            # (mcp.server.fastmcp.FastMCP), which mcp v2 renamed to MCPServer —
+            # `uvx` resolves the newest mcp by default and breaks the import,
+            # so --with "mcp<2" pins the dependency this specific package needs.
+            "command": "uvx",
+            "args": ["--with", "mcp<2", "aviationstack-mcp"],
+            # IMPORTANT: passing `env` to a subprocess REPLACES the entire
+            # environment rather than adding to it. A dict containing only
+            # the API key strips PATH (so "uvx" can't even be located on
+            # Windows) and system vars the child process needs to start at
+            # all. Merge onto a copy of the parent environment instead.
+            "env": {**os.environ, "AVIATION_STACK_API_KEY": AVIATION_STACK_API_KEY},
         },
         "weather": {
             "transport": "stdio",
-            "command": r"C:\Users\HP\OneDrive\Desktop\AI Travel Planning System using LangGraph\.venv\Scripts\python.exe",
-            "args": [
-                r"C:\Users\HP\OneDrive\Desktop\AI Travel Planning System using LangGraph\weather_mcp_server.py"
-            ],
-            "env": {"OPENWEATHER_API_KEY": OPENWEATHER_API_KEY},
+            # Launch with the interpreter that's actually running this process
+            # and a path resolved relative to this file, so it works regardless
+            # of machine, OS, or whether this is invoked from a venv.
+            "command": sys.executable,
+            "args": [str(WEATHER_SERVER_SCRIPT)],
+            # Same env-merge fix as aviationstack above.
+            "env": {**os.environ, "OPENWEATHER_API_KEY": OPENWEATHER_API_KEY},
         },
     }
 )
