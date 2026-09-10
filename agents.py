@@ -30,11 +30,10 @@ def _truncate(text: Any, max_chars: int = 1500) -> str:
     Several nodes (budget_agent, itinerary_agent, final_response_agent)
     concatenate the outputs of every prior specialist agent into a
     single prompt. Each individual output is already a full LLM-written
-    paragraph (or, for hotel_agent, a raw search-API result), so without
-    a cap here the combined prompt can silently exceed the model
-    provider's tokens-per-minute limit — e.g. Groq's on-demand tier caps
-    total request tokens at 8000, and an uncapped itinerary_agent prompt
-    can exceed that on its own.
+    paragraph, so without a cap here the combined prompt can silently
+    exceed the model provider's tokens-per-minute limit -- e.g. Groq's
+    on-demand tier caps total request tokens at 8000, and an uncapped
+    itinerary_agent prompt can exceed that on its own.
 
     ~4 characters per token is a reasonable rule of thumb for English
     prose, so max_chars=1500 keeps a single field to roughly 375 tokens.
@@ -126,7 +125,7 @@ def supervisor_agent(state: TravelState):
     """
 
     if state.get("is_replan"):
-        # A replan pass already set selected_agents via prepare_replan —
+        # A replan pass already set selected_agents via prepare_replan --
         # trust it and skip re-deriving from user_query, or the critic's
         # verdict gets discarded and the loop never converges.
         print("\n========== SUPERVISOR: REPLAN PASS ==========")
@@ -373,20 +372,59 @@ async def hotel_agent(state: TravelState):
     print("=======================================\n")
 
     # Async Tavily/MCP call
-    result = await tavily_search(query)
+    search_result = await tavily_search(query)
 
     print("\n========== HOTEL SEARCH RESULT ==========")
-    print(result)
+    print(search_result)
     print("=========================================\n")
 
-    # Tavily can return a large raw payload (multiple pages of content).
-    # Cap it here at the source so it doesn't blow the token budget of
-    # every downstream prompt (budget_agent, itinerary_agent,
-    # final_response_agent) that includes hotel_results verbatim.
+    # --------------------------------------------------------
+    # LLM prompt
+    #
+    # tavily_search() returns a raw search-API payload (query,
+    # nested result objects, URLs, scores, etc.), not prose -- every
+    # other specialist agent runs its MCP/tool data through an LLM
+    # before storing it in state. hotel_agent was the one place that
+    # skipped this step and stored the raw payload directly as
+    # hotel_results, which is why the UI showed unformatted JSON
+    # instead of readable hotel guidance, and why budget_agent /
+    # itinerary_agent / final_response_agent were writing their
+    # plans off of raw JSON instead of usable hotel info.
+    # --------------------------------------------------------
+
+    prompt = f"""
+Create practical hotel and neighborhood guidance for this trip.
+
+User request: {user_query}
+
+Raw hotel/neighborhood search data: {_truncate(search_result, max_chars=2500)}
+
+Include:
+1. Recommended neighborhoods/areas to stay, with why
+2. 2-3 specific hotel or stay suggestions per recommended area, with an
+   approximate price range if the data supports it
+3. Trade-offs between budget and convenience
+4. Any booking or timing advice implied by the data
+5. Important assumptions
+
+Write in clear prose, not JSON. Do not invent specific prices or
+availability the data doesn't support -- say "approximate" or "typical
+range" where estimating.
+"""
+
+    result = await _llm_text_async(
+        "You are a professional accommodation planning specialist.",
+        prompt,
+    )
+
+    print("\n========== HOTEL AGENT OUTPUT ==========")
+    print(result)
+    print("========================================\n")
+
     return {
-        "hotel_results": _truncate(result, max_chars=2500),
+        "hotel_results": result,
         "messages": [AIMessage(content="Hotel agent completed.")],
-        "llm_calls": state.get("llm_calls", 0),
+        "llm_calls": state.get("llm_calls", 0) + 1,
     }
 
 
@@ -533,7 +571,7 @@ Weather results:
 
 Return ONLY valid JSON using exactly this schema. All cost fields are
 your best numeric ESTIMATES in the same currency implied by trip
-constraints (assume INR if unspecified) — use plain numbers, no
+constraints (assume INR if unspecified) -- use plain numbers, no
 commas or currency symbols:
 
 {{
@@ -639,7 +677,7 @@ def prepare_replan(state: TravelState):
 
 def mark_unresolved(state: TravelState):
     """
-    Loop maxed out — fail open, forward to human_approval flagged rather
+    Loop maxed out -- fail open, forward to human_approval flagged rather
     than blocking the user indefinitely.
     """
 
