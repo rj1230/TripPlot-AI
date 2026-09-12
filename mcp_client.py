@@ -1,6 +1,10 @@
+from __future__ import annotations
+
+import logging
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
@@ -10,124 +14,356 @@ from config import (
     TAVILY_API_KEY,
 )
 
-# --------------------------------------------------------------
-# Resolve the local weather MCP server relative to THIS project,
-# instead of hardcoding a machine-specific absolute path (the old
-# "C:\Users\HP\OneDrive\Desktop\..." path only worked on one laptop
-# and breaks on any other machine, CI runner, or container).
-#
-# sys.executable is used for the interpreter so this also works
-# correctly inside whatever venv the project is actually launched
-# from, on Windows, macOS, or Linux.
-# --------------------------------------------------------------
+logger = logging.getLogger(__name__)
+
+
+# ==============================================================
+# PROJECT PATHS
+# ==============================================================
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 WEATHER_SERVER_SCRIPT = PROJECT_ROOT / "weather_mcp_server.py"
 
 
-# Create MCP Client
+if not WEATHER_SERVER_SCRIPT.exists():
+    raise FileNotFoundError(f"Weather MCP server not found: {WEATHER_SERVER_SCRIPT}")
+
+
+# ==============================================================
+# ENVIRONMENT
+# ==============================================================
+
+
+def _merged_env(**overrides: str | None) -> dict[str, str]:
+    """
+    Preserve the parent process environment and override only the
+    variables required by the MCP subprocess.
+    """
+    env = os.environ.copy()
+
+    for key, value in overrides.items():
+        if value:
+            env[key] = value
+
+    return env
+
+
+# ==============================================================
+# API KEY VALIDATION
+# ==============================================================
+
+
+def validate_mcp_configuration() -> None:
+    """
+    Validate required MCP configuration before the application
+    attempts to initialize external services.
+    """
+
+    missing: list[str] = []
+
+    if not TAVILY_API_KEY:
+        missing.append("TAVILY_API_KEY")
+
+    if not AVIATION_STACK_API_KEY:
+        missing.append("AVIATION_STACK_API_KEY")
+
+    if not OPENWEATHER_API_KEY:
+        missing.append("OPENWEATHER_API_KEY")
+
+    if missing:
+        raise RuntimeError("Missing required MCP configuration: " + ", ".join(missing))
+
+
+# ==============================================================
+# MCP CLIENT
+# ==============================================================
+
+validate_mcp_configuration()
+
 client = MultiServerMCPClient(
     {
+        # ----------------------------------------------------------
+        # Tavily
+        # ----------------------------------------------------------
         "tavily": {
             "transport": "streamable_http",
-            "url": f"https://mcp.tavily.com/mcp/?tavilyApiKey={TAVILY_API_KEY}",
+            "url": (f"https://mcp.tavily.com/mcp/?tavilyApiKey={TAVILY_API_KEY}"),
         },
+        # ----------------------------------------------------------
+        # AviationStack
+        # ----------------------------------------------------------
         "aviationstack": {
             "transport": "stdio",
-            # Uses uvx to run the published aviationstack-mcp package in its own
-            # isolated env. The package itself is pinned to the mcp v1 API
-            # (mcp.server.fastmcp.FastMCP), which mcp v2 renamed to MCPServer —
-            # `uvx` resolves the newest mcp by default and breaks the import,
-            # so --with "mcp<2" pins the dependency this specific package needs.
             "command": "uvx",
-            "args": ["--with", "mcp<2", "aviationstack-mcp"],
-            # IMPORTANT: passing `env` to a subprocess REPLACES the entire
-            # environment rather than adding to it. A dict containing only
-            # the API key strips PATH (so "uvx" can't even be located on
-            # Windows) and system vars the child process needs to start at
-            # all. Merge onto a copy of the parent environment instead.
-            "env": {**os.environ, "AVIATION_STACK_API_KEY": AVIATION_STACK_API_KEY},
+            "args": [
+                "--with",
+                "mcp<2",
+                "aviationstack-mcp",
+            ],
+            "env": _merged_env(
+                AVIATION_STACK_API_KEY=AVIATION_STACK_API_KEY,
+            ),
         },
+        # ----------------------------------------------------------
+        # Weather
+        # ----------------------------------------------------------
         "weather": {
             "transport": "stdio",
-            # Launch with the interpreter that's actually running this process
-            # and a path resolved relative to this file, so it works regardless
-            # of machine, OS, or whether this is invoked from a venv.
             "command": sys.executable,
-            "args": [str(WEATHER_SERVER_SCRIPT)],
-            # Same env-merge fix as aviationstack above.
-            "env": {**os.environ, "OPENWEATHER_API_KEY": OPENWEATHER_API_KEY},
+            "args": [
+                str(WEATHER_SERVER_SCRIPT),
+            ],
+            "env": _merged_env(
+                OPENWEATHER_API_KEY=OPENWEATHER_API_KEY,
+            ),
         },
     }
 )
 
 
-# Cache tools so we don't load them repeatedly
-_tools_cache = None
+# ==============================================================
+# TOOL CACHE
+# ==============================================================
+
+_tools_cache: list[Any] | None = None
+_tool_registry: dict[str, Any] | None = None
 
 
-async def get_tools():
+async def get_tools() -> list[Any]:
+    """
+    Load MCP tools once and cache them.
+
+    This prevents every tool invocation from requiring a complete
+    tool discovery pass.
+    """
+
     global _tools_cache
 
-    if _tools_cache is None:
-        try:
-            _tools_cache = await client.get_tools()
+    if _tools_cache is not None:
+        return _tools_cache
 
-        except Exception as e:
-            print("\n========== FULL ERROR ==========")
-            print(type(e))
-            print(repr(e))
+    try:
+        logger.info("Loading MCP tools...")
 
-            if hasattr(e, "exceptions"):
-                print("\nSUB EXCEPTIONS:")
-                for i, sub in enumerate(e.exceptions):
-                    print(f"\n--- Exception {i + 1} ---")
-                    print(type(sub))
-                    print(repr(sub))
+        _tools_cache = await client.get_tools()
 
-            raise
+        logger.info(
+            "Loaded %d MCP tools: %s",
+            len(_tools_cache),
+            ", ".join(tool.name for tool in _tools_cache),
+        )
 
-    return _tools_cache
+        return _tools_cache
+
+    except Exception:
+        logger.exception("Failed to initialize MCP tools")
+        raise
 
 
-async def call_tool(tool_name: str, args: dict = None):
+async def get_tool_registry() -> dict[str, Any]:
+    """
+    Return MCP tools indexed by name.
+    """
+
+    global _tool_registry
+
+    if _tool_registry is not None:
+        return _tool_registry
+
     tools = await get_tools()
 
-    tool = next(
-        (tool for tool in tools if tool.name == tool_name),
-        None,
-    )
+    _tool_registry = {tool.name: tool for tool in tools}
+
+    return _tool_registry
+
+
+# ==============================================================
+# GENERIC TOOL INVOCATION
+# ==============================================================
+
+
+async def call_tool(
+    tool_name: str,
+    args: dict[str, Any] | None = None,
+) -> Any:
+    """
+    Invoke an MCP tool by name.
+
+    Centralizing invocation here gives the project one place for:
+    - logging
+    - validation
+    - error handling
+    - future retries
+    - latency tracking
+    - tracing
+    """
+
+    registry = await get_tool_registry()
+
+    tool = registry.get(tool_name)
 
     if tool is None:
-        raise ValueError(f"Tool '{tool_name}' not found")
+        available = sorted(registry.keys())
 
-    return await tool.ainvoke(args or {})
+        raise ValueError(
+            f"MCP tool '{tool_name}' not found. Available tools: {available}"
+        )
+
+    payload = args or {}
+
+    logger.info(
+        "MCP tool call: %s | args=%s",
+        tool_name,
+        payload,
+    )
+
+    try:
+        result = await tool.ainvoke(payload)
+
+        logger.info(
+            "MCP tool completed: %s",
+            tool_name,
+        )
+
+        return result
+
+    except Exception:
+        logger.exception(
+            "MCP tool failed: %s | args=%s",
+            tool_name,
+            payload,
+        )
+        raise
 
 
-# ------------------------
-# Tavily MCP Tools
-# ------------------------
+# ==============================================================
+# TAVILY
+# ==============================================================
 
 
-async def tavily_search(query: str):
-    return await call_tool("tavily_search", {"query": query})
+async def tavily_search(query: str) -> Any:
+    if not query.strip():
+        raise ValueError("Tavily search query cannot be empty")
 
-
-async def list_airports(search: str = "", limit: int = 10):
     return await call_tool(
-        "list_airports", {"search": search, "limit": limit, "offset": 0}
+        "tavily_search",
+        {
+            "query": query,
+        },
     )
 
 
-async def list_airlines(search: str = "", limit: int = 10):
+# ==============================================================
+# AVIATION
+# ==============================================================
+
+
+async def list_airports(
+    search: str = "",
+    limit: int = 10,
+) -> Any:
+    limit = max(1, min(limit, 50))
+
     return await call_tool(
-        "list_airlines", {"search": search, "limit": limit, "offset": 0}
+        "list_airports",
+        {
+            "search": search,
+            "limit": limit,
+            "offset": 0,
+        },
     )
 
 
-async def current_weather(city: str):
-    return await call_tool("get_current_weather", {"city": city})
+async def list_airlines(
+    search: str = "",
+    limit: int = 10,
+) -> Any:
+    limit = max(1, min(limit, 50))
+
+    return await call_tool(
+        "list_airlines",
+        {
+            "search": search,
+            "limit": limit,
+            "offset": 0,
+        },
+    )
 
 
-async def forecast(city: str):
-    return await call_tool("get_forecast", {"city": city})
+# ==============================================================
+# WEATHER
+# ==============================================================
+
+
+async def current_weather(city: str) -> Any:
+    if not city.strip():
+        raise ValueError("Weather city cannot be empty")
+
+    return await call_tool(
+        "get_current_weather",
+        {
+            "city": city,
+        },
+    )
+
+
+async def forecast(city: str) -> Any:
+    if not city.strip():
+        raise ValueError("Forecast city cannot be empty")
+
+    return await call_tool(
+        "get_forecast",
+        {
+            "city": city,
+        },
+    )
+
+
+# ==============================================================
+# HEALTH CHECK
+# ==============================================================
+
+
+async def check_mcp_health() -> dict[str, Any]:
+    """
+    Lightweight MCP health check.
+
+    Returns available tool names rather than calling expensive
+    external APIs.
+    """
+
+    try:
+        tools = await get_tools()
+
+        return {
+            "status": "healthy",
+            "tool_count": len(tools),
+            "tools": sorted(tool.name for tool in tools),
+        }
+
+    except Exception as exc:
+        logger.exception("MCP health check failed")
+
+        return {
+            "status": "unhealthy",
+            "tool_count": 0,
+            "tools": [],
+            "error": str(exc),
+        }
+
+
+# ==============================================================
+# CLI TEST
+# ==============================================================
+
+if __name__ == "__main__":
+    import asyncio
+
+    async def _main() -> None:
+        health = await check_mcp_health()
+
+        print("\nMCP HEALTH")
+        print("=" * 50)
+        print(health)
+
+    asyncio.run(_main())

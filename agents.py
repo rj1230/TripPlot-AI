@@ -1,8 +1,16 @@
+from __future__ import annotations
+
+import asyncio
 import json
-from typing import Any
+import logging
+import re
+import time
+from datetime import datetime, timezone
+from typing import Any, Literal, TypeVar
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.types import interrupt
+from pydantic import BaseModel, Field, ValidationError
 
 from config import get_llm
 from mcp_client import (
@@ -16,102 +24,614 @@ from state import TravelState
 
 
 # ============================================================
+# LOGGING
+# ============================================================
+
+logger = logging.getLogger(__name__)
+
+if not logger.handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+MAX_LLM_RETRIES = 2
+MAX_TOOL_RETRIES = 2
+
+TOOL_TIMEOUT_SECONDS = 25
+LLM_TIMEOUT_SECONDS = 45
+
+MAX_PROMPT_CHARS = 7000
+MAX_SPECIALIST_OUTPUT_CHARS = 1800
+
+DEFAULT_CURRENCY = "INR"
+
+ALLOWED_AGENTS = {
+    "flight_agent",
+    "hotel_agent",
+    "weather_agent",
+    "budget_agent",
+    "itinerary_agent",
+}
+
+REPLANNABLE = {
+    "flight_agent",
+    "hotel_agent",
+    "weather_agent",
+    "budget_agent",
+}
+
+
+# ============================================================
 # LLM
 # ============================================================
 
 llm = get_llm()
 
+T = TypeVar("T", bound=BaseModel)
+
+
+# ============================================================
+# PYDANTIC CONTRACTS
+# ============================================================
+
+
+class TripConstraints(BaseModel):
+    """Normalized travel requirements extracted by the supervisor."""
+
+    destination: str = ""
+    origin: str = ""
+    duration: str = ""
+    budget: str = ""
+    travel_style: str = ""
+    special_preferences: list[str] = Field(default_factory=list)
+
+
+class SupervisorDecision(BaseModel):
+    """Structured supervisor routing decision."""
+
+    selected_agents: list[str] = Field(default_factory=list)
+    trip_constraints: TripConstraints = Field(
+        default_factory=TripConstraints
+    )
+    reasoning: str = ""
+
+
+class FlightAnalysis(BaseModel):
+    """Structured flight planning output."""
+
+    recommended_departure_airport: str = ""
+    recommended_arrival_airport: str = ""
+    airlines: list[str] = Field(default_factory=list)
+    approximate_duration: str = ""
+    estimated_fare_range: str = ""
+    direct_available: bool | None = None
+    peak_season_warnings: list[str] = Field(default_factory=list)
+    booking_advice: list[str] = Field(default_factory=list)
+    assumptions: list[str] = Field(default_factory=list)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
+
+class HotelAnalysis(BaseModel):
+    """Structured accommodation planning output."""
+
+    recommended_areas: list[str] = Field(default_factory=list)
+    area_reasons: dict[str, str] = Field(default_factory=dict)
+    hotel_suggestions: list[str] = Field(default_factory=list)
+    approximate_price_ranges: list[str] = Field(default_factory=list)
+    tradeoffs: list[str] = Field(default_factory=list)
+    booking_advice: list[str] = Field(default_factory=list)
+    assumptions: list[str] = Field(default_factory=list)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
+
+class BudgetCategories(BaseModel):
+    flights: float = 0.0
+    hotel: float = 0.0
+    food_and_transport: float = 0.0
+    activities: float = 0.0
+
+
+class BudgetAnalysis(BaseModel):
+    """Structured budget result consumed by critic.py."""
+
+    total_cost: float = 0.0
+    currency: str = DEFAULT_CURRENCY
+    categories: BudgetCategories = Field(
+        default_factory=BudgetCategories
+    )
+    risk_areas: list[str] = Field(default_factory=list)
+    money_saving_suggestions: list[str] = Field(default_factory=list)
+    feasible: bool = False
+    narrative: str = ""
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
+
+class ItineraryAnalysis(BaseModel):
+    """Structured quality metadata for the generated itinerary."""
+
+    overview: str = ""
+    days: list[str] = Field(default_factory=list)
+    transportation: list[str] = Field(default_factory=list)
+    accommodation: list[str] = Field(default_factory=list)
+    food: list[str] = Field(default_factory=list)
+    activities: list[str] = Field(default_factory=list)
+    daily_spending: list[str] = Field(default_factory=list)
+    weather_considerations: list[str] = Field(default_factory=list)
+    tips: list[str] = Field(default_factory=list)
+    budget_summary: str = ""
+    assumptions: list[str] = Field(default_factory=list)
+
+
+class ValidationResult(BaseModel):
+    """Deterministic validation result."""
+
+    passed: bool
+    warnings: list[str] = Field(default_factory=list)
+    violations: list[str] = Field(default_factory=list)
+
+
+# ============================================================
+# GENERAL HELPERS
+# ============================================================
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
 
 def _truncate(text: Any, max_chars: int = 1500) -> str:
     """
-    Cap a piece of text before it's embedded into a downstream LLM
-    prompt.
+    Keep downstream prompts bounded.
 
-    Several nodes (budget_agent, itinerary_agent, final_response_agent)
-    concatenate the outputs of every prior specialist agent into a
-    single prompt. Each individual output is already a full LLM-written
-    paragraph, so without a cap here the combined prompt can silently
-    exceed the model provider's tokens-per-minute limit -- e.g. Groq's
-    on-demand tier caps total request tokens at 8000, and an uncapped
-    itinerary_agent prompt can exceed that on its own.
-
-    ~4 characters per token is a reasonable rule of thumb for English
-    prose, so max_chars=1500 keeps a single field to roughly 375 tokens.
+    This is deliberately conservative because several nodes combine
+    multiple specialist outputs into one LLM request.
     """
 
-    if not text:
+    if text is None:
         return ""
+
+    if isinstance(text, (dict, list, tuple)):
+        try:
+            text = json.dumps(
+                text,
+                ensure_ascii=False,
+                default=str,
+            )
+        except Exception:
+            text = str(text)
 
     text = str(text)
 
     if len(text) <= max_chars:
         return text
 
-    return text[:max_chars] + "\n...[truncated for length]"
+    return text[:max_chars] + "\n...[truncated]"
 
 
-def _llm_text(system: str, prompt: str) -> str:
-    """
-    Synchronous LLM helper for synchronous LangGraph nodes.
-    """
-    response = llm.invoke(
-        [
-            SystemMessage(content=system),
-            HumanMessage(content=prompt),
-        ]
-    )
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        number = float(value)
 
-    return response.content
+        if number != number:
+            return default
+
+        if number == float("inf") or number == float("-inf"):
+            return default
+
+        return number
+
+    except (TypeError, ValueError):
+        return default
 
 
-async def _llm_text_async(system: str, prompt: str) -> str:
-    """
-    Asynchronous LLM helper for asynchronous LangGraph nodes.
-    """
-    response = await llm.ainvoke(
-        [
-            SystemMessage(content=system),
-            HumanMessage(content=prompt),
-        ]
-    )
+def _normalize_confidence(value: Any) -> float:
+    confidence = _safe_float(value, 0.0)
 
-    return response.content
+    if confidence > 1:
+        confidence = confidence / 100
+
+    return max(0.0, min(1.0, confidence))
+
+
+def _increment_llm_calls(state: TravelState, amount: int = 1) -> int:
+    return int(state.get("llm_calls", 0) or 0) + amount
+
+
+def _message(text: str) -> list[AIMessage]:
+    return [AIMessage(content=text)]
 
 
 # ============================================================
-# JSON HELPERS
+# LLM HELPERS
 # ============================================================
 
 
-def _json_from_llm(text: str) -> dict:
+def _llm_text(
+    system: str,
+    prompt: str,
+    *,
+    retries: int = MAX_LLM_RETRIES,
+) -> str:
     """
-    Extract JSON object from an LLM response.
+    Synchronous LLM invocation with bounded retries.
+
+    Important:
+    We don't silently swallow failures. The final exception is
+    propagated so LangGraph/checkpointing can handle it correctly.
     """
 
-    print("\n========== RAW LLM RESPONSE ==========")
-    print(text)
-    print("======================================\n")
+    last_error: Exception | None = None
+
+    for attempt in range(retries + 1):
+        try:
+            response = llm.invoke(
+                [
+                    SystemMessage(content=system),
+                    HumanMessage(content=_truncate(prompt, MAX_PROMPT_CHARS)),
+                ]
+            )
+
+            content = getattr(response, "content", "")
+
+            if isinstance(content, list):
+                content = "\n".join(
+                    str(item)
+                    for item in content
+                )
+
+            content = str(content).strip()
+
+            if not content:
+                raise ValueError("LLM returned an empty response.")
+
+            return content
+
+        except Exception as exc:
+            last_error = exc
+
+            logger.warning(
+                "LLM sync call failed: attempt=%s/%s error=%s",
+                attempt + 1,
+                retries + 1,
+                exc,
+            )
+
+            if attempt < retries:
+                time.sleep(1.5 * (attempt + 1))
+
+    raise RuntimeError(
+        f"LLM invocation failed after {retries + 1} attempts."
+    ) from last_error
+
+
+async def _llm_text_async(
+    system: str,
+    prompt: str,
+    *,
+    retries: int = MAX_LLM_RETRIES,
+) -> str:
+    """Async LLM invocation with timeout and bounded retries."""
+
+    last_error: Exception | None = None
+
+    for attempt in range(retries + 1):
+        try:
+            response = await asyncio.wait_for(
+                llm.ainvoke(
+                    [
+                        SystemMessage(content=system),
+                        HumanMessage(
+                            content=_truncate(
+                                prompt,
+                                MAX_PROMPT_CHARS,
+                            )
+                        ),
+                    ]
+                ),
+                timeout=LLM_TIMEOUT_SECONDS,
+            )
+
+            content = getattr(response, "content", "")
+
+            if isinstance(content, list):
+                content = "\n".join(
+                    str(item)
+                    for item in content
+                )
+
+            content = str(content).strip()
+
+            if not content:
+                raise ValueError("LLM returned an empty response.")
+
+            return content
+
+        except Exception as exc:
+            last_error = exc
+
+            logger.warning(
+                "LLM async call failed: attempt=%s/%s error=%s",
+                attempt + 1,
+                retries + 1,
+                exc,
+            )
+
+            if attempt < retries:
+                await asyncio.sleep(1.5 * (attempt + 1))
+
+    raise RuntimeError(
+        f"Async LLM invocation failed after {retries + 1} attempts."
+    ) from last_error
+
+
+def _structured_llm(
+    model: type[T],
+    system: str,
+    prompt: str,
+    *,
+    retries: int = MAX_LLM_RETRIES,
+) -> T:
+    """
+    Preferred structured-output path.
+
+    Falls back to conservative JSON extraction only when the configured
+    LLM/provider doesn't support native structured output.
+    """
+
+    last_error: Exception | None = None
+
+    for attempt in range(retries + 1):
+        try:
+            structured = llm.with_structured_output(model)
+
+            result = structured.invoke(
+                [
+                    SystemMessage(content=system),
+                    HumanMessage(
+                        content=_truncate(
+                            prompt,
+                            MAX_PROMPT_CHARS,
+                        )
+                    ),
+                ]
+            )
+
+            if isinstance(result, model):
+                return result
+
+            return model.model_validate(result)
+
+        except Exception as exc:
+            last_error = exc
+
+            logger.warning(
+                "Structured LLM call failed: attempt=%s/%s error=%s",
+                attempt + 1,
+                retries + 1,
+                exc,
+            )
+
+            if attempt < retries:
+                time.sleep(1.5 * (attempt + 1))
+
+    # --------------------------------------------------------
+    # Compatibility fallback.
+    #
+    # Some model wrappers/providers don't implement
+    # with_structured_output(). We still validate the final object
+    # through Pydantic rather than returning arbitrary JSON.
+    # --------------------------------------------------------
 
     try:
-        start = text.index("{")
-        end = text.rindex("}") + 1
+        raw = _llm_text(
+            system + "\nReturn ONLY valid JSON.",
+            prompt,
+            retries=1,
+        )
 
-        json_text = text[start:end]
+        payload = _extract_json_object(raw)
 
-        print("\n========== EXTRACTED JSON ==========")
-        print(json_text)
-        print("====================================\n")
+        return model.model_validate(payload)
 
-        return json.loads(json_text)
+    except Exception as fallback_error:
+        raise RuntimeError(
+            f"Structured LLM generation failed for "
+            f"{model.__name__}."
+        ) from (fallback_error or last_error)
 
-    except (ValueError, json.JSONDecodeError) as exc:
-        print("\n========== JSON PARSING ERROR ==========")
-        print(exc)
-        print("========================================\n")
 
+async def _structured_llm_async(
+    model: type[T],
+    system: str,
+    prompt: str,
+    *,
+    retries: int = MAX_LLM_RETRIES,
+) -> T:
+    """
+    Async structured-output helper.
+
+    Uses native structured output first. Falls back to async text +
+    Pydantic validation if necessary.
+    """
+
+    last_error: Exception | None = None
+
+    for attempt in range(retries + 1):
+        try:
+            structured = llm.with_structured_output(model)
+
+            result = await asyncio.wait_for(
+                structured.ainvoke(
+                    [
+                        SystemMessage(content=system),
+                        HumanMessage(
+                            content=_truncate(
+                                prompt,
+                                MAX_PROMPT_CHARS,
+                            )
+                        ),
+                    ]
+                ),
+                timeout=LLM_TIMEOUT_SECONDS,
+            )
+
+            if isinstance(result, model):
+                return result
+
+            return model.model_validate(result)
+
+        except Exception as exc:
+            last_error = exc
+
+            logger.warning(
+                "Async structured LLM call failed: "
+                "attempt=%s/%s error=%s",
+                attempt + 1,
+                retries + 1,
+                exc,
+            )
+
+            if attempt < retries:
+                await asyncio.sleep(1.5 * (attempt + 1))
+
+    try:
+        raw = await _llm_text_async(
+            system + "\nReturn ONLY valid JSON.",
+            prompt,
+            retries=1,
+        )
+
+        payload = _extract_json_object(raw)
+
+        return model.model_validate(payload)
+
+    except Exception as fallback_error:
+        raise RuntimeError(
+            f"Async structured LLM generation failed for "
+            f"{model.__name__}."
+        ) from (fallback_error or last_error)
+
+
+# ============================================================
+# JSON COMPATIBILITY HELPER
+# ============================================================
+
+
+def _extract_json_object(text: str) -> dict:
+    """
+    Compatibility parser.
+
+    This is intentionally NOT the primary structured-output mechanism.
+    Native Pydantic structured output is attempted first.
+    """
+
+    if not text:
+        raise ValueError("Empty LLM response.")
+
+    text = str(text).strip()
+
+    # Remove fenced JSON if present.
+    if "```" in text:
+        text = re.sub(
+            r"```(?:json)?",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+        text = text.replace("```", "").strip()
+
+    start = text.find("{")
+    end = text.rfind("}")
+
+    if start == -1 or end == -1 or end <= start:
         raise ValueError(
-            f"Could not extract valid JSON from LLM response:\n{text}"
-        ) from exc
+            "No JSON object found in LLM response."
+        )
+
+    payload = text[start : end + 1]
+
+    parsed = json.loads(payload)
+
+    if not isinstance(parsed, dict):
+        raise ValueError("Expected a JSON object.")
+
+    return parsed
+
+
+# Backward-compatible alias.
+def _json_from_llm(text: str) -> dict:
+    return _extract_json_object(text)
+
+
+# ============================================================
+# MCP / TOOL HELPERS
+# ============================================================
+
+
+async def _tool_call_async(
+    tool,
+    *args,
+    tool_name: str | None = None,
+    retries: int = MAX_TOOL_RETRIES,
+    timeout: int = TOOL_TIMEOUT_SECONDS,
+    **kwargs,
+):
+    """
+    Reliable async wrapper around MCP tools.
+
+    Handles:
+      - timeout
+      - transient failures
+      - bounded retries
+      - useful logging
+
+    It deliberately raises after exhausting retries instead of
+    pretending that a failed external tool succeeded.
+    """
+
+    name = tool_name or getattr(
+        tool,
+        "__name__",
+        "unknown_tool",
+    )
+
+    last_error: Exception | None = None
+
+    for attempt in range(retries + 1):
+        try:
+            result = await asyncio.wait_for(
+                tool(*args, **kwargs),
+                timeout=timeout,
+            )
+
+            return result
+
+        except Exception as exc:
+            last_error = exc
+
+            logger.warning(
+                "Tool failed: tool=%s attempt=%s/%s error=%s",
+                name,
+                attempt + 1,
+                retries + 1,
+                exc,
+            )
+
+            if attempt < retries:
+                await asyncio.sleep(
+                    1.0 * (attempt + 1)
+                )
+
+    raise RuntimeError(
+        f"Tool '{name}' failed after "
+        f"{retries + 1} attempts."
+    ) from last_error
 
 
 # ============================================================
@@ -121,118 +641,146 @@ def _json_from_llm(text: str) -> dict:
 
 def supervisor_agent(state: TravelState):
     """
-    Supervisor decides which specialist agents should execute.
+    Production supervisor.
+
+    Responsibilities:
+      1. Normalize the user request.
+      2. Select only valid specialist agents.
+      3. Extract structured travel constraints.
+      4. Prevent arbitrary agent routing.
+      5. Preserve targeted replan decisions.
     """
 
     if state.get("is_replan"):
-        # A replan pass already set selected_agents via prepare_replan --
-        # trust it and skip re-deriving from user_query, or the critic's
-        # verdict gets discarded and the loop never converges.
-        print("\n========== SUPERVISOR: REPLAN PASS ==========")
-        print("Trusting selected_agents:", state.get("selected_agents"))
-        print("===============================================\n")
+        selected = [
+            agent
+            for agent in state.get("selected_agents", [])
+            if agent in ALLOWED_AGENTS
+        ]
+
+        if not selected:
+            selected = ["itinerary_agent"]
+
+        logger.info(
+            "Supervisor executing targeted replan: %s",
+            selected,
+        )
 
         return {
-            "is_replan": False,  # reset so a future normal pass isn't skipped
-            "messages": [
-                AIMessage(content="Supervisor routed replan to targeted agents.")
-            ],
+            "selected_agents": selected,
+            "is_replan": False,
+            "messages": _message(
+                "Supervisor routed the targeted replan."
+            ),
         }
 
-    # NOTE: use .get() rather than state["user_query"]. If this node is
-    # ever re-entered with a state that doesn't carry the original
-    # request (e.g. a checkpointer misconfiguration causing a resume to
-    # restart from an empty state), we want a clear, catchable message
-    # here rather than a bare KeyError deep in the graph.
-    query = state.get("user_query", "")
+    query = str(
+        state.get("user_query", "")
+    ).strip()
 
     if not query:
-        print("\n========== SUPERVISOR: MISSING user_query ==========")
-        print("state keys present:", list(state.keys()))
-        print("=====================================================\n")
-
         raise ValueError(
-            "supervisor_agent received a state with no 'user_query'. "
-            "This usually means the graph resumed without its checkpointed "
-            "state (e.g. the checkpointer was recreated between the initial "
-            "call and the resume call). Check that the same checkpointer "
-            "instance/connection is used for a given thread_id across calls."
+            "supervisor_agent received no user_query."
         )
 
     prompt = f"""
-You are the supervisor of a real-world multi-agent travel planning system.
+You are the supervisor and planner of a production travel-planning
+multi-agent system.
 
-Decide which specialist agents are needed for this user request.
+Your job is to determine which specialist agents are actually required.
 
-Available agents:
+AVAILABLE AGENTS:
 
-- flight_agent:
-  Use when flights, airports, airlines, routes, or airfare guidance
-  are needed.
+flight_agent:
+- flights
+- airports
+- airlines
+- route planning
+- airfare guidance
 
-- hotel_agent:
-  Use when hotels, stays, neighborhoods, or accommodation
-  are needed.
+hotel_agent:
+- hotels
+- accommodation
+- neighborhoods
+- areas to stay
 
-- weather_agent:
-  Use when weather, climate, season, packing, or forecast
-  information is useful.
+weather_agent:
+- current weather
+- forecast
+- climate
+- season
+- packing implications
 
-- budget_agent:
-  Use when budget, affordability, cost, or price constraints
-  are mentioned.
+budget_agent:
+- cost estimation
+- affordability
+- budget constraints
+- financial feasibility
 
-- itinerary_agent:
-  Almost always needed to produce the final travel plan.
+itinerary_agent:
+- final day-by-day travel plan
+- practically always required
 
-Return ONLY valid JSON.
+ROUTING RULES:
 
-Use exactly this schema:
+1. Never invent agent names.
+2. itinerary_agent should normally be selected.
+3. Select flight_agent when transportation/flight information is
+   relevant.
+4. Select hotel_agent when accommodation is relevant.
+5. Select weather_agent when weather/season/packing affects the trip.
+6. Select budget_agent when a budget is given or cost planning is
+   materially useful.
+7. Do not select agents merely to increase the number of agents.
+8. Extract only information actually supported by the user request.
+9. Empty strings are preferable to hallucinated details.
 
-{{
-  "selected_agents": [
-    "flight_agent",
-    "hotel_agent",
-    "weather_agent",
-    "budget_agent",
-    "itinerary_agent"
-  ],
-  "trip_constraints": {{
-    "destination": "",
-    "origin": "",
-    "duration": "",
-    "budget": "",
-    "travel_style": "",
-    "special_preferences": []
-  }},
-  "reasoning": ""
-}}
-
-User request:
+USER REQUEST:
 {query}
 """
 
-    raw = _llm_text(
-        "You route work to specialist agents. Return strict JSON only.",
+    decision = _structured_llm(
+        SupervisorDecision,
+        (
+            "You are a strict production routing controller. "
+            "Return a validated structured routing decision. "
+            "Never invent facts."
+        ),
         prompt,
     )
 
-    parsed = _json_from_llm(raw)
+    selected = [
+        agent
+        for agent in decision.selected_agents
+        if agent in ALLOWED_AGENTS
+    ]
 
-    print("\n========== PARSED SUPERVISOR JSON ==========")
-    print(json.dumps(parsed, indent=2))
-    print("=============================================\n")
+    # Itinerary is the normal terminal planning component.
+    if "itinerary_agent" not in selected:
+        selected.append("itinerary_agent")
 
-    selected = parsed.get("selected_agents", [])
-    trip_constraints = parsed.get("trip_constraints", {})
-    reasoning = parsed.get("reasoning", "")
+    # Remove duplicates while preserving order.
+    selected = list(dict.fromkeys(selected))
+
+    constraints = decision.trip_constraints.model_dump()
+
+    logger.info(
+        "Supervisor selected agents=%s destination=%s",
+        selected,
+        constraints.get("destination"),
+    )
 
     return {
         "selected_agents": selected,
-        "trip_constraints": trip_constraints,
-        "supervisor_reasoning": reasoning,
-        "messages": [AIMessage(content="Supervisor created the agent execution plan.")],
-        "llm_calls": state.get("llm_calls", 0) + 1,
+        "trip_constraints": constraints,
+        "supervisor_reasoning": _truncate(
+            decision.reasoning,
+            1200,
+        ),
+        "messages": _message(
+            "Supervisor created a validated execution plan."
+        ),
+        "llm_calls": _increment_llm_calls(state),
     }
 
 
@@ -245,111 +793,150 @@ async def flight_agent(state: TravelState):
     """
     Async flight specialist.
 
-    IMPORTANT:
-    Do NOT use asyncio.run() here.
-    LangGraph can execute async nodes directly.
+    External MCP data is treated as evidence. The LLM is explicitly
+    prohibited from inventing live availability.
     """
 
-    query = state.get("user_query", "")
+    query = str(
+        state.get("user_query", "")
+    )
 
     constraints = state.get(
         "trip_constraints",
         {},
-    )
+    ) or {}
 
-    destination = constraints.get(
-        "destination",
-        "",
-    )
+    destination = str(
+        constraints.get(
+            "destination",
+            "",
+        )
+    ).strip()
 
-    origin = constraints.get(
-        "origin",
-        "",
-    )
+    origin = str(
+        constraints.get(
+            "origin",
+            "",
+        )
+    ).strip()
 
-    print("\n========== FLIGHT AGENT INPUT ==========")
-    print("Query:", query)
-    print("Origin:", origin)
-    print("Destination:", destination)
-    print("Constraints:", constraints)
-    print("========================================\n")
+    if not destination:
+        return {
+            "flight_results": (
+                "Flight planning could not be completed because "
+                "the destination was not identified."
+            ),
+            "messages": _message(
+                "Flight agent could not identify the destination."
+            ),
+        }
 
-    # --------------------------------------------------------
-    # MCP calls
-    # --------------------------------------------------------
-
-    airports = await list_airports(
+    logger.info(
+        "Flight agent: origin=%s destination=%s",
+        origin,
         destination,
-        limit=10,
     )
 
-    airlines = await list_airlines(
-        "",
-        limit=10,
+    # --------------------------------------------------------
+    # MCP DATA
+    # --------------------------------------------------------
+
+    airports, airlines = await asyncio.gather(
+        _tool_call_async(
+            list_airports,
+            destination,
+            limit=10,
+            tool_name="list_airports",
+        ),
+        _tool_call_async(
+            list_airlines,
+            "",
+            limit=10,
+            tool_name="list_airlines",
+        ),
     )
-
-    print("\n========== AIRPORT MCP DATA ==========")
-    print(airports)
-    print("======================================\n")
-
-    print("\n========== AIRLINE MCP DATA ==========")
-    print(airlines)
-    print("======================================\n")
-
-    # --------------------------------------------------------
-    # LLM prompt
-    # --------------------------------------------------------
 
     prompt = f"""
-Create practical flight guidance for this trip.
+Create practical flight guidance using ONLY the supplied evidence.
 
-User request:
-{query}
+USER REQUEST:
+{_truncate(query, 1600)}
 
-Trip constraints:
-{constraints}
+TRIP CONSTRAINTS:
+{_truncate(constraints, 1400)}
 
-Origin:
+ORIGIN:
 {origin}
 
-Destination:
+DESTINATION:
 {destination}
 
-Airport MCP data:
-{_truncate(airports, max_chars=2000)}
+AIRPORT MCP EVIDENCE:
+{_truncate(airports, 2200)}
 
-Airline MCP data:
-{_truncate(airlines, max_chars=2000)}
+AIRLINE MCP EVIDENCE:
+{_truncate(airlines, 1800)}
 
-Include:
+Requirements:
 
-1. Recommended departure airport
-2. Recommended arrival airport
-3. Relevant airlines
-4. Approximate flight duration
-5. Estimated fare range
-6. Direct vs connecting flight considerations
-7. Peak season warnings
-8. Booking advice
-9. Important assumptions
-
-Do not claim that you have live ticket availability unless the
-provided MCP data explicitly contains live availability.
+- Recommend sensible departure/arrival airports when supported.
+- List relevant airlines only when supported by the evidence.
+- Give an approximate duration only as an estimate.
+- Give fare guidance only as an estimate if supported.
+- Distinguish direct vs connecting considerations.
+- Mention peak-season considerations if relevant.
+- Give practical booking advice.
+- Explicitly state assumptions.
+- NEVER claim live availability.
+- NEVER claim a ticket is booked.
+- NEVER invent an exact fare.
 """
 
-    result = await _llm_text_async(
-        "You are a professional flight planning specialist.",
+    analysis = await _structured_llm_async(
+        FlightAnalysis,
+        (
+            "You are a professional flight-planning specialist. "
+            "Ground every recommendation in supplied evidence. "
+            "Never fabricate live inventory."
+        ),
         prompt,
     )
 
-    print("\n========== FLIGHT AGENT OUTPUT ==========")
-    print(result)
-    print("=========================================\n")
+    result = (
+        "Flight Planning\n"
+        f"- Departure airport: "
+        f"{analysis.recommended_departure_airport or 'Not determined'}\n"
+        f"- Arrival airport: "
+        f"{analysis.recommended_arrival_airport or 'Not determined'}\n"
+        f"- Airlines: "
+        f"{', '.join(analysis.airlines) or 'Not determined'}\n"
+        f"- Approximate duration: "
+        f"{analysis.approximate_duration or 'Not available'}\n"
+        f"- Estimated fare range: "
+        f"{analysis.estimated_fare_range or 'Not available'}\n"
+        f"- Direct flight available: "
+        f"{analysis.direct_available}\n"
+        f"- Peak-season warnings: "
+        f"{'; '.join(analysis.peak_season_warnings) or 'None identified'}\n"
+        f"- Booking advice: "
+        f"{'; '.join(analysis.booking_advice) or 'Compare current fares before booking'}\n"
+        f"- Assumptions: "
+        f"{'; '.join(analysis.assumptions) or 'None'}\n"
+        f"- Confidence: "
+        f"{_normalize_confidence(analysis.confidence):.2f}\n"
+        f"- Retrieved at: {_utc_now()}\n"
+        "\nImportant: This is planning guidance, not a confirmed booking."
+    )
 
     return {
-        "flight_results": result,
-        "messages": [AIMessage(content="Flight agent completed.")],
-        "llm_calls": state.get("llm_calls", 0) + 1,
+        "flight_results": _truncate(
+            result,
+            MAX_SPECIALIST_OUTPUT_CHARS,
+        ),
+        "messages": _message(
+            "Flight agent completed using validated MCP evidence."
+        ),
+        "llm_calls": _increment_llm_calls(state),
     }
 
 
@@ -360,71 +947,112 @@ provided MCP data explicitly contains live availability.
 
 async def hotel_agent(state: TravelState):
     """
-    Async hotel/accommodation specialist.
+    Accommodation specialist.
+
+    Tavily/MCP output is first treated as raw evidence and then
+    transformed into structured recommendations.
     """
 
-    user_query = state.get("user_query", "")
+    user_query = str(
+        state.get("user_query", "")
+    ).strip()
 
-    query = f"Best hotels, neighborhoods, and areas to stay for: {user_query}"
+    if not user_query:
+        raise ValueError(
+            "hotel_agent requires user_query."
+        )
 
-    print("\n========== HOTEL AGENT INPUT ==========")
-    print(query)
-    print("=======================================\n")
+    query = (
+        "Find reliable hotel, accommodation, and neighborhood "
+        f"information for this travel request:\n{user_query}"
+    )
 
-    # Async Tavily/MCP call
-    search_result = await tavily_search(query)
+    logger.info("Hotel agent executing search.")
 
-    print("\n========== HOTEL SEARCH RESULT ==========")
-    print(search_result)
-    print("=========================================\n")
-
-    # --------------------------------------------------------
-    # LLM prompt
-    #
-    # tavily_search() returns a raw search-API payload (query,
-    # nested result objects, URLs, scores, etc.), not prose -- every
-    # other specialist agent runs its MCP/tool data through an LLM
-    # before storing it in state. hotel_agent was the one place that
-    # skipped this step and stored the raw payload directly as
-    # hotel_results, which is why the UI showed unformatted JSON
-    # instead of readable hotel guidance, and why budget_agent /
-    # itinerary_agent / final_response_agent were writing their
-    # plans off of raw JSON instead of usable hotel info.
-    # --------------------------------------------------------
+    search_result = await _tool_call_async(
+        tavily_search,
+        query,
+        tool_name="tavily_search",
+    )
 
     prompt = f"""
-Create practical hotel and neighborhood guidance for this trip.
+Create practical accommodation guidance from the supplied search
+evidence.
 
-User request: {user_query}
+USER REQUEST:
+{_truncate(user_query, 1800)}
 
-Raw hotel/neighborhood search data: {_truncate(search_result, max_chars=2500)}
+RAW SEARCH EVIDENCE:
+{_truncate(search_result, 3200)}
 
-Include:
-1. Recommended neighborhoods/areas to stay, with why
-2. 2-3 specific hotel or stay suggestions per recommended area, with an
-   approximate price range if the data supports it
-3. Trade-offs between budget and convenience
-4. Any booking or timing advice implied by the data
-5. Important assumptions
+Requirements:
 
-Write in clear prose, not JSON. Do not invent specific prices or
-availability the data doesn't support -- say "approximate" or "typical
-range" where estimating.
+1. Recommend useful neighborhoods/areas.
+2. Explain why each area fits the trip.
+3. Give 2-3 specific stay suggestions where the evidence supports them.
+4. Include approximate price ranges only when supported.
+5. Explain budget/convenience trade-offs.
+6. Give booking timing advice when supported.
+7. Clearly identify assumptions.
+8. Do NOT invent hotel availability.
+9. Do NOT invent exact prices.
+10. Do NOT claim that a reservation exists.
 """
 
-    result = await _llm_text_async(
-        "You are a professional accommodation planning specialist.",
+    analysis = await _structured_llm_async(
+        HotelAnalysis,
+        (
+            "You are a professional accommodation specialist. "
+            "Use supplied search evidence and avoid unsupported claims."
+        ),
         prompt,
     )
 
-    print("\n========== HOTEL AGENT OUTPUT ==========")
-    print(result)
-    print("========================================\n")
+    area_lines = []
+
+    for area in analysis.recommended_areas:
+        reason = analysis.area_reasons.get(
+            area,
+            "",
+        )
+
+        if reason:
+            area_lines.append(
+                f"- {area}: {reason}"
+            )
+        else:
+            area_lines.append(
+                f"- {area}"
+            )
+
+    result = (
+        "Accommodation Planning\n"
+        f"Recommended areas:\n"
+        f"{chr(10).join(area_lines) or '- No specific area established'}\n\n"
+        "Hotel/stay suggestions:\n"
+        f"{chr(10).join('- ' + x for x in analysis.hotel_suggestions) or '- None established'}\n\n"
+        "Approximate price ranges:\n"
+        f"{chr(10).join('- ' + x for x in analysis.approximate_price_ranges) or '- None established'}\n\n"
+        "Trade-offs:\n"
+        f"{chr(10).join('- ' + x for x in analysis.tradeoffs) or '- None identified'}\n\n"
+        "Booking advice:\n"
+        f"{chr(10).join('- ' + x for x in analysis.booking_advice) or '- Compare current availability before booking'}\n\n"
+        "Assumptions:\n"
+        f"{chr(10).join('- ' + x for x in analysis.assumptions) or '- None'}\n"
+        f"\nConfidence: {_normalize_confidence(analysis.confidence):.2f}"
+        f"\nRetrieved at: {_utc_now()}"
+        "\n\nImportant: Suggestions are not confirmed reservations."
+    )
 
     return {
-        "hotel_results": result,
-        "messages": [AIMessage(content="Hotel agent completed.")],
-        "llm_calls": state.get("llm_calls", 0) + 1,
+        "hotel_results": _truncate(
+            result,
+            MAX_SPECIALIST_OUTPUT_CHARS,
+        ),
+        "messages": _message(
+            "Hotel agent completed using search evidence."
+        ),
+        "llm_calls": _increment_llm_calls(state),
     }
 
 
@@ -436,66 +1064,144 @@ range" where estimating.
 async def weather_agent(state: TravelState):
     """
     Async weather specialist.
+
+    Weather is time-sensitive, so the retrieval timestamp is included.
     """
 
     constraints = state.get(
         "trip_constraints",
         {},
-    )
+    ) or {}
 
-    city = constraints.get(
-        "destination",
-        "",
-    )
-
-    print("\n========== WEATHER AGENT INPUT ==========")
-    print("City:", city)
-    print("Constraints:", constraints)
-    print("=========================================\n")
+    city = str(
+        constraints.get(
+            "destination",
+            "",
+        )
+    ).strip()
 
     if not city:
         return {
             "weather_results": (
-                "Weather information could not be retrieved "
-                "because the destination was not identified."
+                "Weather information could not be retrieved because "
+                "the destination was not identified."
             ),
-            "messages": [
-                AIMessage(content="Weather agent could not identify destination.")
-            ],
+            "messages": _message(
+                "Weather agent could not identify destination."
+            ),
         }
 
-    # --------------------------------------------------------
-    # MCP calls
-    # --------------------------------------------------------
+    logger.info(
+        "Weather agent: destination=%s",
+        city,
+    )
 
-    weather_data = await current_weather(city)
+    weather_data, forecast_data = await asyncio.gather(
+        _tool_call_async(
+            current_weather,
+            city,
+            tool_name="current_weather",
+        ),
+        _tool_call_async(
+            forecast,
+            city,
+            tool_name="forecast",
+        ),
+    )
 
-    forecast_data = await forecast(city)
+    retrieved_at = _utc_now()
 
-    print("\n========== CURRENT WEATHER ==========")
-    print(weather_data)
-    print("=====================================\n")
-
-    print("\n========== WEATHER FORECAST ==========")
-    print(forecast_data)
-    print("======================================\n")
-
-    result = f"""
-Current weather:
-{weather_data}
-
-Forecast:
-{forecast_data}
-"""
-
-    print("\n========== WEATHER AGENT OUTPUT ==========")
-    print(result)
-    print("==========================================\n")
+    result = (
+        "Current weather:\n"
+        f"{_truncate(weather_data, 1100)}\n\n"
+        "Forecast:\n"
+        f"{_truncate(forecast_data, 1500)}\n\n"
+        f"Retrieved at: {retrieved_at}\n"
+        "Weather data is time-sensitive; verify near departure."
+    )
 
     return {
-        "weather_results": result,
-        "messages": [AIMessage(content="Weather agent completed.")],
+        "weather_results": _truncate(
+            result,
+            MAX_SPECIALIST_OUTPUT_CHARS,
+        ),
+        "messages": _message(
+            "Weather agent completed using current MCP weather data."
+        ),
+        "llm_calls": _increment_llm_calls(state),
     }
+
+
+# ============================================================
+# BUDGET VALIDATION
+# ============================================================
+
+
+def _validate_budget(
+    analysis: BudgetAnalysis,
+) -> ValidationResult:
+    """
+    Deterministic budget arithmetic validation.
+
+    This prevents the LLM from returning a total that doesn't equal
+    its own category breakdown.
+    """
+
+    categories = analysis.categories
+
+    calculated_total = (
+        categories.flights
+        + categories.hotel
+        + categories.food_and_transport
+        + categories.activities
+    )
+
+    warnings: list[str] = []
+    violations: list[str] = []
+
+    if analysis.total_cost < 0:
+        violations.append(
+            "Budget total cannot be negative."
+        )
+
+    if any(
+        value < 0
+        for value in [
+            categories.flights,
+            categories.hotel,
+            categories.food_and_transport,
+            categories.activities,
+        ]
+    ):
+        violations.append(
+            "Budget categories cannot contain negative values."
+        )
+
+    if analysis.total_cost > 0:
+        difference = abs(
+            calculated_total - analysis.total_cost
+        )
+
+        tolerance = max(
+            100.0,
+            analysis.total_cost * 0.05,
+        )
+
+        if difference > tolerance:
+            violations.append(
+                "Budget total does not match the category breakdown."
+            )
+
+    if not analysis.currency:
+        warnings.append(
+            "Budget currency was not explicitly established."
+        )
+
+    return ValidationResult(
+        passed=not violations,
+        warnings=warnings,
+        violations=violations,
+    )
 
 
 # ============================================================
@@ -505,145 +1211,173 @@ Forecast:
 
 def budget_agent(state: TravelState):
     """
-    Analyze whether the planned trip is financially realistic.
+    Analyze financial feasibility.
 
-    Returns BOTH:
-      - budget_results: human-readable prose assessment (consumed by
-        itinerary_agent / final_response_agent prompts)
-      - budget_analysis: structured numeric breakdown (consumed by
-        critic.py's deterministic rule_based_checks, which needs a
-        real total_cost to compare against trip_constraints["budget"])
+    Important production behavior:
+      - structured output first
+      - Pydantic validation
+      - deterministic arithmetic validation
+      - no silent empty-analysis fallback
     """
 
-    print("\n========== BUDGET AGENT INPUT ==========")
-
-    print("Trip Constraints:")
-    print(
-        state.get(
-            "trip_constraints",
-            {},
-        )
-    )
-
-    print("\nFlight Results:")
-    print(
-        state.get(
-            "flight_results",
-            "",
-        )
-    )
-
-    print("\nHotel Results:")
-    print(
-        state.get(
-            "hotel_results",
-            "",
-        )
-    )
-
-    print("\nWeather Results:")
-    print(
-        state.get(
-            "weather_results",
-            "",
-        )
-    )
-
-    print("=========================================\n")
+    constraints = state.get(
+        "trip_constraints",
+        {},
+    ) or {}
 
     prompt = f"""
-Analyze whether this trip plan is realistic for the user's budget.
+Analyze whether this trip is financially realistic.
 
-User request:
-{state.get("user_query", "")}
+USER REQUEST:
+{_truncate(state.get("user_query", ""), 1800)}
 
-Trip constraints:
-{state.get("trip_constraints", {})}
+TRIP CONSTRAINTS:
+{_truncate(constraints, 1500)}
 
-Flight results:
-{_truncate(state.get("flight_results", ""))}
+FLIGHT EVIDENCE:
+{_truncate(state.get("flight_results", ""), 1600)}
 
-Hotel results:
-{_truncate(state.get("hotel_results", ""))}
+HOTEL EVIDENCE:
+{_truncate(state.get("hotel_results", ""), 1600)}
 
-Weather results:
-{_truncate(state.get("weather_results", ""), max_chars=800)}
+WEATHER EVIDENCE:
+{_truncate(state.get("weather_results", ""), 900)}
 
-Return ONLY valid JSON using exactly this schema. All cost fields are
-your best numeric ESTIMATES in the same currency implied by trip
-constraints (assume INR if unspecified) -- use plain numbers, no
-commas or currency symbols:
+Rules:
 
-{{
-  "total_cost": 0,
-  "currency": "INR",
-  "categories": {{
-    "flights": 0,
-    "hotel": 0,
-    "food_and_transport": 0,
-    "activities": 0
-  }},
-  "risk_areas": [],
-  "money_saving_suggestions": [],
-  "feasible": true,
-  "narrative": ""
-}}
-
-"narrative" should be a concise prose assessment covering:
-1. Estimated cost categories
-2. Flight cost estimate
-3. Hotel/accommodation estimate
-4. Food and local transportation estimate
-5. Activity/sightseeing estimate
-6. Risk areas
-7. Money-saving suggestions
-8. Whether the trip appears feasible
-
-Clearly distinguish estimates from confirmed prices within the narrative.
+- All numbers are estimates unless externally confirmed.
+- Use the currency implied by the user's budget.
+- If no currency is specified, use INR.
+- Never claim a confirmed price.
+- Do not invent a booking.
+- total_cost must equal the sum of categories.
+- If insufficient evidence exists, say so explicitly.
+- confidence must reflect evidence quality.
 """
 
-    raw = _llm_text(
-        "You are a practical travel budget analyst. Return strict JSON only.",
+    analysis = _structured_llm(
+        BudgetAnalysis,
+        (
+            "You are a conservative travel budget analyst. "
+            "Never fabricate confirmed prices. "
+            "Return internally consistent numeric estimates."
+        ),
         prompt,
     )
 
-    try:
-        parsed = _json_from_llm(raw)
-    except ValueError:
-        # Fail open: keep the raw prose as budget_results, but leave
-        # budget_analysis empty so the critic's numeric check simply
-        # skips (rather than crashing the graph run).
-        print("\n========== BUDGET AGENT: JSON PARSE FAILED, FALLING BACK ==========")
-        print("==================================================================\n")
+    validation = _validate_budget(
+        analysis
+    )
+
+    # --------------------------------------------------------
+    # One targeted repair attempt if arithmetic is inconsistent.
+    # --------------------------------------------------------
+
+    if not validation.passed:
+        repair_prompt = f"""
+Repair the following budget analysis.
+
+Original analysis:
+{analysis.model_dump_json(indent=2)}
+
+Validation problems:
+{validation.violations}
+
+Make the category totals mathematically consistent.
+Do not invent new evidence.
+
+Return a corrected structured budget analysis.
+"""
+
+        analysis = _structured_llm(
+            BudgetAnalysis,
+            (
+                "You repair financial calculation consistency. "
+                "Do not change unsupported facts."
+            ),
+            repair_prompt,
+        )
+
+        validation = _validate_budget(
+            analysis
+        )
+
+    # --------------------------------------------------------
+    # Hard safety fallback.
+    # --------------------------------------------------------
+
+    if not validation.passed:
+        logger.error(
+            "Budget validation failed: %s",
+            validation.violations,
+        )
 
         return {
-            "budget_results": raw,
+            "budget_results": (
+                "Budget analysis could not be validated reliably. "
+                "The trip should be treated as requiring manual budget "
+                "verification before relying on the estimate."
+            ),
             "budget_analysis": {},
-            "messages": [AIMessage(content="Budget agent completed (fallback).")],
-            "llm_calls": state.get("llm_calls", 0) + 1,
+            "messages": _message(
+                "Budget analysis requires verification."
+            ),
+            "llm_calls": _increment_llm_calls(
+                state,
+                2,
+            ),
         }
 
-    narrative = parsed.get("narrative", "") or raw
+    categories = analysis.categories.model_dump()
 
     budget_analysis = {
-        "total_cost": parsed.get("total_cost"),
-        "currency": parsed.get("currency", "INR"),
-        "categories": parsed.get("categories", {}),
-        "risk_areas": parsed.get("risk_areas", []),
-        "money_saving_suggestions": parsed.get("money_saving_suggestions", []),
-        "feasible": parsed.get("feasible"),
+        "total_cost": round(
+            _safe_float(analysis.total_cost),
+            2,
+        ),
+        "currency": (
+            analysis.currency
+            or DEFAULT_CURRENCY
+        ),
+        "categories": categories,
+        "risk_areas": analysis.risk_areas,
+        "money_saving_suggestions": (
+            analysis.money_saving_suggestions
+        ),
+        "feasible": bool(
+            analysis.feasible
+        ),
+        "confidence": _normalize_confidence(
+            analysis.confidence
+        ),
     }
 
-    print("\n========== BUDGET AGENT OUTPUT ==========")
-    print("Narrative:", narrative)
-    print("Structured analysis:", json.dumps(budget_analysis, indent=2, default=str))
-    print("=========================================\n")
+    narrative = analysis.narrative.strip()
+
+    if not narrative:
+        narrative = (
+            "Estimated total: "
+            f"{budget_analysis['currency']} "
+            f"{budget_analysis['total_cost']:.2f}."
+        )
+
+    narrative += (
+        "\n\nBudget validation: PASS."
+    )
 
     return {
-        "budget_results": narrative,
+        "budget_results": _truncate(
+            narrative,
+            MAX_SPECIALIST_OUTPUT_CHARS,
+        ),
         "budget_analysis": budget_analysis,
-        "messages": [AIMessage(content="Budget agent completed.")],
-        "llm_calls": state.get("llm_calls", 0) + 1,
+        "messages": _message(
+            "Budget agent completed with deterministic validation."
+        ),
+        "llm_calls": _increment_llm_calls(
+            state,
+            1,
+        ),
     }
 
 
@@ -651,45 +1385,87 @@ Clearly distinguish estimates from confirmed prices within the narrative.
 # REPLAN HELPERS
 # ============================================================
 
-REPLANNABLE = {"flight_agent", "hotel_agent", "weather_agent", "budget_agent"}
-
 
 def prepare_replan(state: TravelState):
     """
-    Narrow selected_agents to only what the critic flagged and mark this
-    as a replan pass so supervisor_agent doesn't re-derive from user_query.
+    Route only the agents identified as responsible by the critic.
+
+    This prevents a failed weather check from unnecessarily re-running
+    every specialist.
     """
 
-    verdict = state.get("critic_verdict", {})
-    responsible = [a for a in verdict.get("responsible_agents", []) if a in REPLANNABLE]
+    verdict = state.get(
+        "critic_verdict",
+        {},
+    ) or {}
 
-    print("\n========== PREPARING REPLAN ==========")
-    print("Responsible agents:", responsible)
-    print("=======================================\n")
+    responsible = [
+        agent
+        for agent in verdict.get(
+            "responsible_agents",
+            [],
+        )
+        if agent in REPLANNABLE
+    ]
+
+    # Defensive deduplication.
+    responsible = list(
+        dict.fromkeys(responsible)
+    )
+
+    logger.warning(
+        "Preparing targeted replan: %s",
+        responsible,
+    )
+
+    if not responsible:
+        # If no specialist is identified, rebuilding the itinerary is
+        # safer than looping through arbitrary agents.
+        selected = ["itinerary_agent"]
+    else:
+        selected = responsible
 
     return {
-        "selected_agents": responsible or ["itinerary_agent"],
+        "selected_agents": selected,
         "is_replan": True,
         "unresolved_violations": [],
-        "messages": [AIMessage(content=f"Replanning via: {responsible}")],
+        "messages": _message(
+            "Targeted replan prepared for: "
+            + ", ".join(selected)
+        ),
     }
 
 
 def mark_unresolved(state: TravelState):
     """
-    Loop maxed out -- fail open, forward to human_approval flagged rather
-    than blocking the user indefinitely.
+    Critic loop exhausted.
+
+    Do not pretend the plan is perfect. Preserve the unresolved
+    violations so the human approval stage can see them.
     """
 
-    verdict = state.get("critic_verdict", {})
+    verdict = state.get(
+        "critic_verdict",
+        {},
+    ) or {}
+
+    violations = verdict.get(
+        "violations",
+        [],
+    )
+
+    logger.warning(
+        "Maximum critic iterations reached. "
+        "Unresolved violations=%s",
+        violations,
+    )
 
     return {
-        "unresolved_violations": verdict.get("violations", []),
-        "messages": [
-            AIMessage(
-                content="Max critic iterations reached; forwarding for human review."
-            )
-        ],
+        "unresolved_violations": violations,
+        "messages": _message(
+            "Maximum correction attempts reached; "
+            "unresolved issues were forwarded for human review."
+        ),
     }
 
 
@@ -700,115 +1476,144 @@ def mark_unresolved(state: TravelState):
 
 def itinerary_agent(state: TravelState):
     """
-    Combine all specialist outputs into a draft itinerary.
+    Generate a draft itinerary from specialist evidence.
+
+    The itinerary agent is explicitly instructed to distinguish:
+      - confirmed tool facts
+      - estimates
+      - recommendations
+      - assumptions
     """
 
-    print("\n========== ITINERARY AGENT INPUT ==========")
+    constraints = state.get(
+        "trip_constraints",
+        {},
+    ) or {}
 
-    print("Trip Constraints:")
-    print(
-        state.get(
-            "trip_constraints",
-            {},
-        )
-    )
-
-    print("\nFlight Results:")
-    print(
-        state.get(
-            "flight_results",
-            "",
-        )
-    )
-
-    print("\nHotel Results:")
-    print(
-        state.get(
-            "hotel_results",
-            "",
-        )
-    )
-
-    print("\nWeather Results:")
-    print(
-        state.get(
-            "weather_results",
-            "",
-        )
-    )
-
-    print("\nBudget Results:")
-    print(
-        state.get(
-            "budget_results",
-            "",
-        )
-    )
-
-    print("===========================================\n")
+    budget_analysis = state.get(
+        "budget_analysis",
+        {},
+    ) or {}
 
     prompt = f"""
-Create a clear draft travel itinerary.
+Create a practical draft travel itinerary.
 
-User request:
-{state.get("user_query", "")}
+USER REQUEST:
+{_truncate(state.get("user_query", ""), 1800)}
 
-Trip constraints:
-{state.get("trip_constraints", {})}
+TRIP CONSTRAINTS:
+{_truncate(constraints, 1500)}
 
-Flight results:
-{_truncate(state.get("flight_results", ""))}
+FLIGHT EVIDENCE:
+{_truncate(state.get("flight_results", ""), 1500)}
 
-Hotel results:
-{_truncate(state.get("hotel_results", ""))}
+HOTEL EVIDENCE:
+{_truncate(state.get("hotel_results", ""), 1500)}
 
-Weather results:
-{_truncate(state.get("weather_results", ""), max_chars=800)}
+WEATHER EVIDENCE:
+{_truncate(state.get("weather_results", ""), 1000)}
 
-Budget results:
-{_truncate(state.get("budget_results", ""))}
+BUDGET EVIDENCE:
+{_truncate(state.get("budget_results", ""), 1400)}
 
-Create a practical itinerary.
+STRUCTURED BUDGET:
+{_truncate(budget_analysis, 1200)}
 
-Structure the answer as:
+Produce a realistic itinerary.
 
-- Trip overview
-- Day-by-day itinerary
-- Flights / transportation
-- Accommodation recommendations
-- Food recommendations
-- Activities
-- Estimated daily spending
-- Weather considerations
-- Important travel tips
-- Budget summary
+Required structure:
 
-Do not invent confirmed bookings.
-Clearly identify estimates and recommendations.
+1. Trip overview
+2. Day-by-day itinerary
+3. Flights / transportation
+4. Accommodation
+5. Food
+6. Activities
+7. Estimated daily spending
+8. Weather considerations
+9. Important travel tips
+10. Budget summary
+11. Assumptions
+
+CRITICAL GROUNDING RULES:
+
+- Do not claim a booking exists.
+- Do not claim live flight/hotel availability.
+- Do not invent exact prices.
+- Clearly label estimates.
+- Do not contradict the structured budget.
+- Do not introduce destinations not requested unless clearly marked
+  as an optional recommendation.
+- Keep the itinerary practical rather than filling every hour.
 """
 
     result = _llm_text(
-        "You are an expert itinerary planner.",
+        (
+            "You are an expert itinerary planner. "
+            "You synthesize supplied evidence without hallucinating "
+            "bookings, prices, or availability."
+        ),
         prompt,
     )
 
-    print("\n========== ITINERARY OUTPUT ==========")
-    print(result)
-    print("======================================\n")
+    result = _truncate(
+        result,
+        5000,
+    )
+
+    # --------------------------------------------------------
+    # Deterministic lightweight sanity checks.
+    # --------------------------------------------------------
+
+    warnings: list[str] = []
+
+    lowered = result.lower()
+
+    suspicious_booking_phrases = [
+        "your flight is booked",
+        "your hotel is booked",
+        "reservation confirmed",
+        "booking confirmed",
+        "ticket has been booked",
+    ]
+
+    for phrase in suspicious_booking_phrases:
+        if phrase in lowered:
+            warnings.append(
+                f"Potential unsupported booking claim: '{phrase}'."
+            )
+
+    if warnings:
+        logger.warning(
+            "Itinerary grounding warnings: %s",
+            warnings,
+        )
 
     approval_request = f"""
 Please review this draft travel plan.
 
+DRAFT:
 {result}
 
-Reply with approval or feedback.
+Before approving, check:
+
+- Does it satisfy the original request?
+- Are the dates/duration sensible?
+- Are budget estimates consistent?
+- Are unsupported booking claims absent?
+- Are assumptions clearly identified?
+- Are there any safety or practical issues?
+
+If you reject it, provide specific corrections.
 """
 
     return {
         "itinerary": result,
         "approval_request": approval_request,
-        "messages": [AIMessage(content="Draft itinerary created for human review.")],
-        "llm_calls": state.get("llm_calls", 0) + 1,
+        "messages": _message(
+            "Draft itinerary created for review."
+        ),
+        "llm_calls": _increment_llm_calls(state),
     }
 
 
@@ -819,33 +1624,56 @@ Reply with approval or feedback.
 
 def human_approval_agent(state: TravelState):
     """
-    Pause the graph and request human approval.
+    Human-in-the-loop approval.
+
+    Unresolved critic violations are explicitly surfaced to the human.
     """
+
+    unresolved = state.get(
+        "unresolved_violations",
+        [],
+    ) or []
+
+    approval_request = state.get(
+        "approval_request",
+        "",
+    )
+
+    if unresolved:
+        approval_request = (
+            approval_request
+            + "\n\nUNRESOLVED SYSTEM WARNINGS:\n"
+            + "\n".join(
+                f"- {item}"
+                for item in unresolved
+            )
+        )
 
     feedback = interrupt(
         {
-            "question": "Do you approve this itinerary?",
+            "question": (
+                "Do you approve this itinerary? "
+                "Please review any unresolved warnings."
+            ),
             "draft_itinerary": state.get(
                 "itinerary",
                 "",
             ),
-            "approval_request": state.get(
-                "approval_request",
-                "",
-            ),
+            "approval_request": approval_request,
+            "unresolved_violations": unresolved,
             "expected_response": {
                 "approved": True,
-                "feedback": "Optional feedback for revision",
+                "feedback": (
+                    "Optional feedback for revision"
+                ),
             },
         }
     )
 
-    # --------------------------------------------------------
-    # Defensive parsing
-    # --------------------------------------------------------
-
     if not isinstance(feedback, dict):
-        raise ValueError("Human approval response must be a dictionary.")
+        raise ValueError(
+            "Human approval response must be a dictionary."
+        )
 
     approved = bool(
         feedback.get(
@@ -854,20 +1682,24 @@ def human_approval_agent(state: TravelState):
         )
     )
 
-    human_feedback = feedback.get(
-        "feedback",
-        "",
-    )
+    human_feedback = str(
+        feedback.get(
+            "feedback",
+            "",
+        )
+    ).strip()
 
-    print("\n========== HUMAN APPROVAL ==========")
-    print("Approved:", approved)
-    print("Feedback:", human_feedback)
-    print("====================================\n")
+    logger.info(
+        "Human approval completed: approved=%s",
+        approved,
+    )
 
     return {
         "approved": approved,
         "human_feedback": human_feedback,
-        "messages": [AIMessage(content="Human approval step completed.")],
+        "messages": _message(
+            "Human approval step completed."
+        ),
     }
 
 
@@ -878,52 +1710,83 @@ def human_approval_agent(state: TravelState):
 
 def final_response_agent(state: TravelState):
     """
-    Generate the final user-facing travel plan.
+    Produce the final user-facing response.
+
+    Final generation is deliberately grounded in the already-created
+    itinerary rather than asking the LLM to rediscover the trip.
     """
 
-    approved = state.get(
-        "approved",
-        False,
+    approved = bool(
+        state.get(
+            "approved",
+            False,
+        )
     )
 
-    human_feedback = state.get(
-        "human_feedback",
-        "",
+    human_feedback = str(
+        state.get(
+            "human_feedback",
+            "",
+        )
     )
 
-    user_query = state.get("user_query", "")
+    user_query = str(
+        state.get(
+            "user_query",
+            "",
+        )
+    )
 
-    print("\n========== FINAL AGENT INPUT ==========")
-    print("Approved:", approved)
-    print("Feedback:", human_feedback)
-    print("=======================================\n")
+    unresolved = state.get(
+        "unresolved_violations",
+        [],
+    ) or []
 
-    # --------------------------------------------------------
-    # Approved itinerary
-    # --------------------------------------------------------
+    budget_analysis = state.get(
+        "budget_analysis",
+        {},
+    ) or {}
 
     if approved:
-        prompt = f"""
-The human approved this draft itinerary.
+        mode_instruction = """
+The human approved the draft.
 
-Produce the final polished travel plan.
+Preserve the approved plan unless there is an obvious factual
+consistency issue. Produce a polished final response.
+"""
+    else:
+        mode_instruction = """
+The human did NOT approve the draft.
 
-Original user request:
-{user_query}
+Revise the plan according to the human feedback. Do not blindly
+preserve rejected elements.
+"""
 
-Trip constraints:
-{state.get("trip_constraints", {})}
+    prompt = f"""
+{mode_instruction}
 
-Draft itinerary:
-{_truncate(state.get("itinerary", ""), max_chars=3000)}
+ORIGINAL USER REQUEST:
+{_truncate(user_query, 1800)}
 
-Budget notes:
-{_truncate(state.get("budget_results", ""))}
+TRIP CONSTRAINTS:
+{_truncate(state.get("trip_constraints", {}), 1400)}
 
-Human feedback:
-{human_feedback}
+DRAFT ITINERARY:
+{_truncate(state.get("itinerary", ""), 3200)}
 
-Create a clear, practical, user-ready final travel plan.
+BUDGET:
+{_truncate(state.get("budget_results", ""), 1300)}
+
+STRUCTURED BUDGET:
+{_truncate(budget_analysis, 1200)}
+
+HUMAN FEEDBACK:
+{_truncate(human_feedback, 1200)}
+
+UNRESOLVED WARNINGS:
+{_truncate(unresolved, 1000)}
+
+Produce the final user-ready travel plan.
 
 Include:
 
@@ -935,55 +1798,96 @@ Include:
 6. Activities
 7. Budget
 8. Weather considerations
-9. Travel tips
+9. Important travel tips
+10. Assumptions / things to verify
 
-Do not claim that anything is booked unless the system
-actually confirmed a booking.
-"""
+FINAL GROUNDING RULES:
 
-    # --------------------------------------------------------
-    # Rejected itinerary
-    # --------------------------------------------------------
-
-    else:
-        prompt = f"""
-The human did not approve the draft itinerary.
-
-Create a revised travel plan using the human's feedback.
-
-Original user request:
-{user_query}
-
-Trip constraints:
-{state.get("trip_constraints", {})}
-
-Previous draft:
-{_truncate(state.get("itinerary", ""), max_chars=3000)}
-
-Human feedback:
-{human_feedback}
-
-Budget notes:
-{_truncate(state.get("budget_results", ""))}
-
-Revise the itinerary according to the feedback.
-
-Clearly explain the improved plan and keep it practical.
-Do not claim that anything is booked unless the system
-actually confirmed a booking.
+- Never say a flight is booked.
+- Never say a hotel is booked.
+- Never say availability is confirmed unless the system explicitly
+  obtained booking confirmation.
+- Never present estimates as guaranteed prices.
+- Keep budget numbers consistent with the structured budget.
+- Clearly identify assumptions.
+- If information is uncertain, say so.
+- Do not introduce unsupported facts.
 """
 
     result = _llm_text(
-        "You produce final user-ready travel plans.",
+        (
+            "You produce final production-quality travel plans. "
+            "You are a grounded synthesis layer, not a booking engine. "
+            "Never fabricate reservations or availability."
+        ),
         prompt,
     )
 
-    print("\n========== FINAL RESPONSE ==========")
-    print(result)
-    print("====================================\n")
+    result = _truncate(
+        result,
+        6500,
+    )
+
+    # --------------------------------------------------------
+    # Final output guardrail
+    # --------------------------------------------------------
+
+    forbidden_claims = [
+        "flight is booked",
+        "hotel is booked",
+        "reservation is confirmed",
+        "ticket is confirmed",
+        "booking is confirmed",
+    ]
+
+    lowered = result.lower()
+
+    detected = [
+        phrase
+        for phrase in forbidden_claims
+        if phrase in lowered
+    ]
+
+    if detected:
+        logger.warning(
+            "Final response contained potentially unsupported claims: %s",
+            detected,
+        )
+
+        # One corrective pass instead of silently returning unsafe
+        # wording.
+        repair_prompt = f"""
+Rewrite the following final travel response.
+
+Remove or correct these unsupported booking claims:
+{detected}
+
+Response:
+{result}
+
+Rules:
+- Never claim a booking exists.
+- Replace unsupported confirmation language with neutral planning
+  language such as "consider booking", "recommended", or
+  "availability should be checked".
+- Preserve the useful travel information.
+"""
+
+        result = _llm_text(
+            (
+                "You are a strict output-safety editor for travel "
+                "planning."
+            ),
+            repair_prompt,
+            retries=1,
+        )
 
     return {
         "final_response": result,
-        "messages": [AIMessage(content=result)],
-        "llm_calls": state.get("llm_calls", 0) + 1,
+        "messages": [
+            AIMessage(
+                content=result
+            )
+        ],
+        "llm_calls": _increment_llm_calls(state),
     }

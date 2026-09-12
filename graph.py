@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 
 import psycopg
-
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.graph import END, START, StateGraph
@@ -29,6 +29,19 @@ from state import TravelState
 
 
 # ============================================================
+# LOGGING
+# ============================================================
+
+logger = logging.getLogger(__name__)
+
+if not logger.handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+
+
+# ============================================================
 # CONFIGURATION
 # ============================================================
 
@@ -39,6 +52,21 @@ AGENT_ORDER = [
     "budget_agent",
     "itinerary_agent",
 ]
+
+SPECIALIST_AGENTS = {
+    "flight_agent",
+    "hotel_agent",
+    "weather_agent",
+    "budget_agent",
+    "itinerary_agent",
+}
+
+REPLANNABLE_AGENTS = {
+    "flight_agent",
+    "hotel_agent",
+    "weather_agent",
+    "budget_agent",
+}
 
 ROUTE_MAP = {
     "flight_agent": "flight_agent",
@@ -58,24 +86,67 @@ MAX_ITERATIONS = 3
 
 
 # ============================================================
+# CHECKPOINTER STATE
+# ============================================================
+
+_memory_checkpointer: MemorySaver | None = None
+_memory_app = None
+
+_compile_lock = asyncio.Lock()
+
+
+# ============================================================
 # HELPERS
 # ============================================================
 
 
 def _selected_agents(state: TravelState) -> list[str]:
     """
-    Return selected agents in deterministic execution order.
+    Return valid selected agents in deterministic execution order.
 
-    The supervisor may return agents in any order. We always execute
-    them according to AGENT_ORDER.
+    The supervisor may return agents in arbitrary order, but the
+    orchestration layer always executes them in AGENT_ORDER.
     """
 
-    selected = state.get("selected_agents", [])
+    selected = state.get("selected_agents", []) or []
 
-    if not selected:
+    if not isinstance(selected, list):
+        logger.warning(
+            "selected_agents is not a list: %r",
+            selected,
+        )
         return []
 
-    return [agent for agent in AGENT_ORDER if agent in selected]
+    selected_set = {agent for agent in selected if agent in SPECIALIST_AGENTS}
+
+    ordered = [agent for agent in AGENT_ORDER if agent in selected_set]
+
+    logger.info(
+        "Validated selected agents: %s",
+        ordered,
+    )
+
+    return ordered
+
+
+def _current_iteration(state: TravelState) -> int:
+    """
+    Safely retrieve the current critic/replan iteration.
+    """
+
+    try:
+        return max(
+            0,
+            int(
+                state.get(
+                    "iteration_count",
+                    0,
+                )
+                or 0
+            ),
+        )
+    except (TypeError, ValueError):
+        return 0
 
 
 # ============================================================
@@ -85,43 +156,76 @@ def _selected_agents(state: TravelState) -> list[str]:
 
 def route_from_supervisor(state: TravelState) -> str:
     """
-    Supervisor -> first selected specialist agent.
+    Supervisor -> first selected specialist.
+
+    If no valid specialist is selected, safely fall back to
+    itinerary generation.
     """
 
     selected = _selected_agents(state)
 
     if selected:
-        return selected[0]
+        first = selected[0]
 
-    # Always generate an itinerary if supervisor selected nothing.
+        logger.info(
+            "Supervisor routing -> %s",
+            first,
+        )
+
+        return first
+
+    logger.warning(
+        "Supervisor selected no valid agents. Falling back to itinerary_agent."
+    )
+
     return "itinerary_agent"
 
 
 def route_after_agent(current_agent: str):
     """
-    Create routing function for specialist agents.
+    Deterministic specialist-agent routing.
 
     Example:
 
-        flight -> hotel -> weather -> budget -> itinerary
+        flight
+          ↓
+        hotel
+          ↓
+        weather
+          ↓
+        budget
+          ↓
+        itinerary
 
-    Only selected agents are executed.
+    Only agents selected by the supervisor/replanner execute.
     """
 
     def route(state: TravelState) -> str:
         selected = _selected_agents(state)
 
-        try:
-            current_index = AGENT_ORDER.index(current_agent)
-        except ValueError:
+        if current_agent not in AGENT_ORDER:
+            logger.error(
+                "Unknown current agent: %s",
+                current_agent,
+            )
             return "itinerary_agent"
 
-        # Find the next selected specialist.
+        current_index = AGENT_ORDER.index(current_agent)
+
         for next_agent in AGENT_ORDER[current_index + 1 :]:
             if next_agent in selected:
+                logger.info(
+                    "%s -> %s",
+                    current_agent,
+                    next_agent,
+                )
                 return next_agent
 
-        # Always finish specialist execution with itinerary.
+        logger.info(
+            "%s -> itinerary_agent",
+            current_agent,
+        )
+
         return "itinerary_agent"
 
     return route
@@ -134,43 +238,154 @@ def route_after_agent(current_agent: str):
 
 def route_after_critic(state: TravelState) -> str:
     """
-    Critic routing:
+    Route based on the critic's quality decision.
 
-        PASS
-            -> human_approval
+    PASS:
+        Human approval.
 
-        FAIL + retries remaining
-            -> prepare_replan
+    REVIEW:
+        Human approval with warnings.
 
-        FAIL + max retries reached
-            -> mark_unresolved
+    REPLAN:
+        Targeted replanning unless the iteration limit is reached.
+
+    IMPORTANT:
+        iteration_count is owned by critic.py.
+        Do NOT increment it here.
     """
 
-    verdict = state.get("critic_verdict", {})
+    verdict = state.get("critic_verdict", {}) or {}
+
+    if not isinstance(verdict, dict):
+        logger.error(
+            "critic_verdict is not a dictionary: %r",
+            verdict,
+        )
+
+        return "mark_unresolved"
+
+    decision = str(verdict.get("decision", "")).upper().strip()
 
     passed = bool(verdict.get("passed", False))
 
-    iteration_count = int(state.get("iteration_count", 0))
+    iteration_count = _current_iteration(state)
+
+    logger.info(
+        "Critic decision=%s passed=%s iteration=%s/%s",
+        decision,
+        passed,
+        iteration_count,
+        MAX_ITERATIONS,
+    )
 
     # --------------------------------------------------------
-    # Critic passed
+    # PASS
     # --------------------------------------------------------
 
-    if passed:
+    if decision == "PASS" or (not decision and passed):
+        logger.info("Critic PASS -> human approval.")
+
         return "human_approval"
 
     # --------------------------------------------------------
-    # Maximum retry count reached
+    # REVIEW
+    # --------------------------------------------------------
+    #
+    # REVIEW means the plan is not clean enough for automatic
+    # approval, but it should be presented to the human rather
+    # than automatically regenerated.
+    # --------------------------------------------------------
+
+    if decision == "REVIEW":
+        logger.warning("Critic REVIEW -> human approval.")
+
+        return "human_approval"
+
+    # --------------------------------------------------------
+    # MAX ITERATIONS
     # --------------------------------------------------------
 
     if iteration_count >= MAX_ITERATIONS:
+        logger.warning(
+            "Critic iteration limit reached: %s/%s",
+            iteration_count,
+            MAX_ITERATIONS,
+        )
+
         return "mark_unresolved"
 
     # --------------------------------------------------------
-    # Retry / replan
+    # REPLAN
     # --------------------------------------------------------
 
-    return "prepare_replan"
+    if decision == "REPLAN":
+        logger.warning("Critic REPLAN -> targeted replanning.")
+
+        return "prepare_replan"
+
+    # --------------------------------------------------------
+    # LEGACY FALLBACK
+    # --------------------------------------------------------
+    #
+    # If an older critic only returns passed=False, preserve
+    # backward compatibility by treating it as a replan request.
+    # --------------------------------------------------------
+
+    if not decision and not passed:
+        logger.warning("Legacy critic verdict detected. Routing to targeted replan.")
+
+        return "prepare_replan"
+
+    # --------------------------------------------------------
+    # UNKNOWN DECISION
+    # --------------------------------------------------------
+
+    logger.error(
+        "Unknown critic decision=%r. Failing safely to human review.",
+        decision,
+    )
+
+    return "human_approval"
+
+
+# ============================================================
+# CRITIC WRAPPER
+# ============================================================
+
+
+def critic_agent_node(
+    state: TravelState,
+):
+    """
+    Thin orchestration wrapper around critic_node.
+
+    The critic owns quality evaluation and iteration_count.
+    """
+
+    logger.info("Critic evaluation started.")
+
+    result = critic_node(
+        state,
+        llm,
+    )
+
+    if not isinstance(result, dict):
+        raise TypeError("critic_node must return a dictionary.")
+
+    verdict = result.get(
+        "critic_verdict",
+        {},
+    )
+
+    if isinstance(verdict, dict):
+        logger.info(
+            "Critic completed: decision=%s quality=%s confidence=%s",
+            verdict.get("decision"),
+            verdict.get("quality_score"),
+            verdict.get("confidence"),
+        )
+
+    return result
 
 
 # ============================================================
@@ -182,28 +397,14 @@ def build_graph() -> StateGraph:
     """
     Build the LangGraph StateGraph.
 
-    IMPORTANT:
-    This function returns the graph BUILDER.
-
-    Do NOT call:
-
-        build_graph().ainvoke(...)
-
-    Instead use:
-
-        await compile_graph_and_invoke(...)
-
-    or:
-
-        graph = build_graph()
-        app = graph.compile(...)
-        await app.ainvoke(...)
+    The builder is intentionally separate from compilation so it
+    can be inspected and tested independently.
     """
 
     graph = StateGraph(TravelState)
 
     # ========================================================
-    # NODES
+    # SPECIALIST NODES
     # ========================================================
 
     graph.add_node(
@@ -236,9 +437,13 @@ def build_graph() -> StateGraph:
         itinerary_agent,
     )
 
+    # ========================================================
+    # QUALITY CONTROL
+    # ========================================================
+
     graph.add_node(
         "critic",
-        lambda state: critic_node(state, llm),
+        critic_agent_node,
     )
 
     graph.add_node(
@@ -250,6 +455,10 @@ def build_graph() -> StateGraph:
         "mark_unresolved",
         mark_unresolved,
     )
+
+    # ========================================================
+    # HUMAN / OUTPUT
+    # ========================================================
 
     graph.add_node(
         "human_approval",
@@ -271,7 +480,7 @@ def build_graph() -> StateGraph:
     )
 
     # ========================================================
-    # SUPERVISOR -> SPECIALIST
+    # SUPERVISOR -> FIRST SPECIALIST
     # ========================================================
 
     graph.add_conditional_edges(
@@ -281,7 +490,7 @@ def build_graph() -> StateGraph:
     )
 
     # ========================================================
-    # SPECIALIST ROUTING
+    # SPECIALIST PIPELINE
     # ========================================================
 
     graph.add_conditional_edges(
@@ -318,7 +527,7 @@ def build_graph() -> StateGraph:
     )
 
     # ========================================================
-    # CRITIC ROUTING
+    # CRITIC -> QUALITY DECISION
     # ========================================================
 
     graph.add_conditional_edges(
@@ -328,7 +537,23 @@ def build_graph() -> StateGraph:
     )
 
     # ========================================================
-    # REPLAN
+    # TARGETED REPLAN LOOP
+    #
+    # critic
+    #    ↓
+    # prepare_replan
+    #    ↓
+    # supervisor
+    #    ↓
+    # selected specialist agents
+    #    ↓
+    # itinerary
+    #    ↓
+    # critic
+    #
+    # IMPORTANT:
+    # critic.py owns iteration_count.
+    # There is deliberately NO replan_iteration node.
     # ========================================================
 
     graph.add_edge(
@@ -346,7 +571,7 @@ def build_graph() -> StateGraph:
     )
 
     # ========================================================
-    # HUMAN APPROVAL -> FINAL
+    # HUMAN -> FINAL
     # ========================================================
 
     graph.add_edge(
@@ -363,70 +588,40 @@ def build_graph() -> StateGraph:
         END,
     )
 
+    logger.info("TravelPlanner StateGraph constructed successfully.")
+
     return graph
 
 
 # ============================================================
-# COMPILE
+# CHECKPOINTER / COMPILATION
 # ============================================================
-#
-# IMPORTANT — CHECKPOINTER LIFETIME BUG FIX
-# ------------------------------------------------------------
-# run_graph() is called twice per trip: once for the initial
-# request (which pauses at the human_approval interrupt), and
-# once again on resume after the user submits their approval.
-#
-# The interrupt/resume mechanism only works if BOTH calls use
-# the SAME checkpointer instance for a given thread_id, because
-# that's where LangGraph stores the paused state.
-#
-# - Postgres (AsyncPostgresSaver): safe to build a new connection
-#   per call, because the checkpoint DATA lives in the database,
-#   not in the Python connection object. A fresh connection can
-#   still read a thread_id's prior checkpoint.
-#
-# - MemorySaver: stores checkpoints in an in-process Python dict
-#   that belongs to that one object. Creating `MemorySaver()`
-#   fresh on every call (as before) wiped all prior checkpoints
-#   before the resume call could ever see them — so on resume,
-#   LangGraph had nothing to continue from, restarted the graph
-#   from START with the bare Command(resume=...) as input, and
-#   supervisor_agent crashed on state["user_query"] because that
-#   input never contained the original request.
-#
-# Fix: keep a single module-level MemorySaver (and its compiled
-# app) alive for the lifetime of the process, and reuse it on
-# every call when no DATABASE_URL is configured.
-# ============================================================
-
-_memory_checkpointer: MemorySaver | None = None
-_memory_app = None
-_compile_lock = asyncio.Lock()
 
 
 async def compile_graph():
     """
     Compile the graph into a runnable LangGraph application.
 
-    If DATABASE_URL exists:
-        AsyncPostgresSaver (new connection per call; checkpoint data
-        persists in the database itself, so this is safe).
+    PostgreSQL:
+        A fresh async connection is created for the invocation.
 
-    Otherwise:
-        A single, process-wide MemorySaver reused across calls, so
-        that the human-approval interrupt/resume cycle actually has
-        somewhere to resume from.
+    MemorySaver:
+        A process-wide singleton is reused so interrupt/resume
+        works across Streamlit requests.
     """
 
-    global _memory_checkpointer, _memory_app
-
-    graph = build_graph()
+    global _memory_checkpointer
+    global _memory_app
 
     # --------------------------------------------------------
     # PostgreSQL
     # --------------------------------------------------------
 
     if DATABASE_URL:
+        logger.info("Compiling graph with PostgreSQL checkpointer.")
+
+        graph = build_graph()
+
         conn = await psycopg.AsyncConnection.connect(
             DATABASE_URL,
             autocommit=True,
@@ -434,25 +629,36 @@ async def compile_graph():
 
         checkpointer = AsyncPostgresSaver(conn)
 
-        # Create checkpoint tables if necessary.
         await checkpointer.setup()
 
-        return graph.compile(checkpointer=checkpointer), conn
+        app = graph.compile(checkpointer=checkpointer)
+
+        return app, conn
 
     # --------------------------------------------------------
-    # In-memory fallback (singleton — see note above)
+    # MEMORY
     # --------------------------------------------------------
 
     async with _compile_lock:
         if _memory_app is None:
+            logger.warning(
+                "DATABASE_URL is not configured. Using process-local MemorySaver."
+            )
+
             _memory_checkpointer = MemorySaver()
+
+            graph = build_graph()
+
             _memory_app = graph.compile(checkpointer=_memory_checkpointer)
 
-    return _memory_app, None
+        return (
+            _memory_app,
+            None,
+        )
 
 
 # ============================================================
-# RUN GRAPH
+# GRAPH INVOCATION
 # ============================================================
 
 
@@ -461,24 +667,57 @@ async def run_graph(
     config: dict,
 ):
     """
-    Run the compiled graph asynchronously.
+    Primary graph execution entry point.
 
-    This is the function Streamlit should call.
-
-    PostgreSQL connections are created and closed per invocation.
-    This avoids Streamlit's multiple-event-loop problems. The
-    in-memory checkpointer (used when DATABASE_URL is unset) is a
-    process-wide singleton reused across calls — see compile_graph().
+    A stable thread_id is mandatory because the graph contains
+    human interrupt/resume behavior.
     """
+
+    if not isinstance(
+        config,
+        dict,
+    ):
+        raise TypeError("config must be a dictionary.")
+
+    configurable = config.get(
+        "configurable",
+        {},
+    )
+
+    if not isinstance(
+        configurable,
+        dict,
+    ):
+        raise TypeError("config['configurable'] must be a dictionary.")
+
+    thread_id = configurable.get("thread_id")
+
+    if not thread_id:
+        raise ValueError(
+            "run_graph requires "
+            "config['configurable']['thread_id'] "
+            "for checkpointed execution and "
+            "human approval."
+        )
 
     conn = None
 
     try:
         app, conn = await compile_graph()
 
+        logger.info(
+            "Invoking TravelPlanner graph: thread_id=%s",
+            thread_id,
+        )
+
         result = await app.ainvoke(
             input_data,
             config=config,
+        )
+
+        logger.info(
+            "TravelPlanner graph completed: thread_id=%s",
+            thread_id,
         )
 
         return result
@@ -487,19 +726,43 @@ async def run_graph(
         if conn is not None:
             try:
                 await conn.close()
-            except Exception:
-                pass
+
+            except Exception as exc:
+                logger.warning(
+                    "Failed to close PostgreSQL connection: %s",
+                    exc,
+                )
 
 
 # ============================================================
-# CLI TEST
+# GRAPH INSPECTION
+# ============================================================
+
+
+def get_graph():
+    """
+    Return a compiled graph using the default in-memory
+    compilation path.
+
+    This helper is intended for inspection/testing.
+
+    Production execution should use compile_graph().
+    """
+
+    graph = build_graph()
+
+    return graph.compile()
+
+
+# ============================================================
+# CLI GRAPH TEST
 # ============================================================
 
 
 async def _test_graph():
 
     print("=" * 70)
-    print("BUILDING TRAVEL PLANNER GRAPH")
+    print("TRIPPLOT-AI GRAPH VALIDATION")
     print("=" * 70)
 
     graph = build_graph()
@@ -511,7 +774,7 @@ async def _test_graph():
 
     try:
         if DATABASE_URL:
-            print("Using PostgreSQL checkpointer.")
+            print("Checkpointer: PostgreSQL")
 
             conn = await psycopg.AsyncConnection.connect(
                 DATABASE_URL,
@@ -525,18 +788,46 @@ async def _test_graph():
             app = graph.compile(checkpointer=checkpointer)
 
         else:
-            print("DATABASE_URL not configured.")
-            print("Using MemorySaver.")
+            print("Checkpointer: MemorySaver")
 
-            app = graph.compile(checkpointer=MemorySaver())
+            checkpointer = MemorySaver()
+
+            app = graph.compile(checkpointer=checkpointer)
 
         print("Graph compiled successfully.")
-        print("Runnable type:", type(app).__name__)
-        print("ainvoke available:", hasattr(app, "ainvoke"))
+
+        print(
+            "Runnable type:",
+            type(app).__name__,
+        )
+
+        print(
+            "ainvoke available:",
+            hasattr(
+                app,
+                "ainvoke",
+            ),
+        )
+
+        print("Graph validation: PASS")
+
+    except Exception as exc:
+        print("Graph validation: FAIL")
+
+        print(f"Error: {exc}")
+
+        raise
 
     finally:
         if conn is not None:
             await conn.close()
+
+    print("=" * 70)
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 
 if __name__ == "__main__":
