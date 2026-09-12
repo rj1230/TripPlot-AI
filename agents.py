@@ -96,9 +96,7 @@ class SupervisorDecision(BaseModel):
     """Structured supervisor routing decision."""
 
     selected_agents: list[str] = Field(default_factory=list)
-    trip_constraints: TripConstraints = Field(
-        default_factory=TripConstraints
-    )
+    trip_constraints: TripConstraints = Field(default_factory=TripConstraints)
     reasoning: str = ""
 
 
@@ -142,9 +140,7 @@ class BudgetAnalysis(BaseModel):
 
     total_cost: float = 0.0
     currency: str = DEFAULT_CURRENCY
-    categories: BudgetCategories = Field(
-        default_factory=BudgetCategories
-    )
+    categories: BudgetCategories = Field(default_factory=BudgetCategories)
     risk_areas: list[str] = Field(default_factory=list)
     money_saving_suggestions: list[str] = Field(default_factory=list)
     feasible: bool = False
@@ -214,7 +210,7 @@ def _truncate(text: Any, max_chars: int = 1500) -> str:
     return text[:max_chars] + "\n...[truncated]"
 
 
-def _safe_float(value: Any, default: float = 0.0) -> float:
+def _safe_float(value: Any, default: float | None = 0.0) -> float | None:
     try:
         number = float(value)
 
@@ -280,10 +276,7 @@ def _llm_text(
             content = getattr(response, "content", "")
 
             if isinstance(content, list):
-                content = "\n".join(
-                    str(item)
-                    for item in content
-                )
+                content = "\n".join(str(item) for item in content)
 
             content = str(content).strip()
 
@@ -340,10 +333,7 @@ async def _llm_text_async(
             content = getattr(response, "content", "")
 
             if isinstance(content, list):
-                content = "\n".join(
-                    str(item)
-                    for item in content
-                )
+                content = "\n".join(str(item) for item in content)
 
             content = str(content).strip()
 
@@ -441,8 +431,7 @@ def _structured_llm(
 
     except Exception as fallback_error:
         raise RuntimeError(
-            f"Structured LLM generation failed for "
-            f"{model.__name__}."
+            f"Structured LLM generation failed for {model.__name__}."
         ) from (fallback_error or last_error)
 
 
@@ -490,8 +479,7 @@ async def _structured_llm_async(
             last_error = exc
 
             logger.warning(
-                "Async structured LLM call failed: "
-                "attempt=%s/%s error=%s",
+                "Async structured LLM call failed: attempt=%s/%s error=%s",
                 attempt + 1,
                 retries + 1,
                 exc,
@@ -513,8 +501,7 @@ async def _structured_llm_async(
 
     except Exception as fallback_error:
         raise RuntimeError(
-            f"Async structured LLM generation failed for "
-            f"{model.__name__}."
+            f"Async structured LLM generation failed for {model.__name__}."
         ) from (fallback_error or last_error)
 
 
@@ -550,9 +537,7 @@ def _extract_json_object(text: str) -> dict:
     end = text.rfind("}")
 
     if start == -1 or end == -1 or end <= start:
-        raise ValueError(
-            "No JSON object found in LLM response."
-        )
+        raise ValueError("No JSON object found in LLM response.")
 
     payload = text[start : end + 1]
 
@@ -567,6 +552,84 @@ def _extract_json_object(text: str) -> dict:
 # Backward-compatible alias.
 def _json_from_llm(text: str) -> dict:
     return _extract_json_object(text)
+
+
+# ============================================================
+# MCP RESPONSE PARSING HELPERS
+# ============================================================
+
+
+def _extract_mcp_text(payload: Any) -> str:
+    """
+    MCP tool results commonly come back as a list of content blocks:
+
+        [{"type": "text", "text": "...json or plain text...", "id": "..."}]
+
+    This pulls out and concatenates the actual text content instead of
+    letting the raw block structure leak into prompts/output.
+    """
+
+    if payload is None:
+        return ""
+
+    if isinstance(payload, str):
+        return payload
+
+    if isinstance(payload, list):
+        parts = []
+
+        for item in payload:
+            if isinstance(item, dict) and "text" in item:
+                parts.append(str(item["text"]))
+            elif isinstance(item, dict):
+                # Unknown block shape; keep something rather than nothing.
+                parts.append(json.dumps(item, ensure_ascii=False, default=str))
+            else:
+                parts.append(str(item))
+
+        return "\n".join(parts)
+
+    if isinstance(payload, dict) and "text" in payload:
+        return str(payload["text"])
+
+    return str(payload)
+
+
+def _parse_mcp_json(payload: Any) -> dict | list | None:
+    """
+    Extract the text content from an MCP tool response and parse it as
+    JSON. Returns None (never raises) if parsing fails, so callers can
+    degrade gracefully instead of crashing on a malformed tool response.
+    """
+
+    text = _extract_mcp_text(payload).strip()
+
+    if not text:
+        return None
+
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+    # Some MCP servers double-encode: the "text" field is itself a
+    # JSON string containing JSON. Try one more decode if we got a str.
+    if isinstance(parsed, str):
+        try:
+            parsed = json.loads(parsed)
+        except (json.JSONDecodeError, TypeError):
+            return None
+
+    return parsed
+
+
+def _format_temp(value: Any) -> str:
+    number = _safe_float(value, default=None) if value is not None else None
+
+    if number is None:
+        return "N/A"
+
+    return f"{number:.1f}°C"
 
 
 # ============================================================
@@ -624,13 +687,10 @@ async def _tool_call_async(
             )
 
             if attempt < retries:
-                await asyncio.sleep(
-                    1.0 * (attempt + 1)
-                )
+                await asyncio.sleep(1.0 * (attempt + 1))
 
     raise RuntimeError(
-        f"Tool '{name}' failed after "
-        f"{retries + 1} attempts."
+        f"Tool '{name}' failed after {retries + 1} attempts."
     ) from last_error
 
 
@@ -669,19 +729,13 @@ def supervisor_agent(state: TravelState):
         return {
             "selected_agents": selected,
             "is_replan": False,
-            "messages": _message(
-                "Supervisor routed the targeted replan."
-            ),
+            "messages": _message("Supervisor routed the targeted replan."),
         }
 
-    query = str(
-        state.get("user_query", "")
-    ).strip()
+    query = str(state.get("user_query", "")).strip()
 
     if not query:
-        raise ValueError(
-            "supervisor_agent received no user_query."
-        )
+        raise ValueError("supervisor_agent received no user_query.")
 
     prompt = f"""
 You are the supervisor and planner of a production travel-planning
@@ -749,11 +803,7 @@ USER REQUEST:
         prompt,
     )
 
-    selected = [
-        agent
-        for agent in decision.selected_agents
-        if agent in ALLOWED_AGENTS
-    ]
+    selected = [agent for agent in decision.selected_agents if agent in ALLOWED_AGENTS]
 
     # Itinerary is the normal terminal planning component.
     if "itinerary_agent" not in selected:
@@ -777,9 +827,7 @@ USER REQUEST:
             decision.reasoning,
             1200,
         ),
-        "messages": _message(
-            "Supervisor created a validated execution plan."
-        ),
+        "messages": _message("Supervisor created a validated execution plan."),
         "llm_calls": _increment_llm_calls(state),
     }
 
@@ -797,14 +845,15 @@ async def flight_agent(state: TravelState):
     prohibited from inventing live availability.
     """
 
-    query = str(
-        state.get("user_query", "")
-    )
+    query = str(state.get("user_query", ""))
 
-    constraints = state.get(
-        "trip_constraints",
-        {},
-    ) or {}
+    constraints = (
+        state.get(
+            "trip_constraints",
+            {},
+        )
+        or {}
+    )
 
     destination = str(
         constraints.get(
@@ -826,9 +875,7 @@ async def flight_agent(state: TravelState):
                 "Flight planning could not be completed because "
                 "the destination was not identified."
             ),
-            "messages": _message(
-                "Flight agent could not identify the destination."
-            ),
+            "messages": _message("Flight agent could not identify the destination."),
         }
 
     logger.info(
@@ -933,9 +980,7 @@ Requirements:
             result,
             MAX_SPECIALIST_OUTPUT_CHARS,
         ),
-        "messages": _message(
-            "Flight agent completed using validated MCP evidence."
-        ),
+        "messages": _message("Flight agent completed using validated MCP evidence."),
         "llm_calls": _increment_llm_calls(state),
     }
 
@@ -953,14 +998,10 @@ async def hotel_agent(state: TravelState):
     transformed into structured recommendations.
     """
 
-    user_query = str(
-        state.get("user_query", "")
-    ).strip()
+    user_query = str(state.get("user_query", "")).strip()
 
     if not user_query:
-        raise ValueError(
-            "hotel_agent requires user_query."
-        )
+        raise ValueError("hotel_agent requires user_query.")
 
     query = (
         "Find reliable hotel, accommodation, and neighborhood "
@@ -1017,13 +1058,9 @@ Requirements:
         )
 
         if reason:
-            area_lines.append(
-                f"- {area}: {reason}"
-            )
+            area_lines.append(f"- {area}: {reason}")
         else:
-            area_lines.append(
-                f"- {area}"
-            )
+            area_lines.append(f"- {area}")
 
     result = (
         "Accommodation Planning\n"
@@ -1049,15 +1086,13 @@ Requirements:
             result,
             MAX_SPECIALIST_OUTPUT_CHARS,
         ),
-        "messages": _message(
-            "Hotel agent completed using search evidence."
-        ),
+        "messages": _message("Hotel agent completed using search evidence."),
         "llm_calls": _increment_llm_calls(state),
     }
 
 
 # ============================================================
-# WEATHER AGENT
+# WEATHER AGENT (improved)
 # ============================================================
 
 
@@ -1065,13 +1100,27 @@ async def weather_agent(state: TravelState):
     """
     Async weather specialist.
 
-    Weather is time-sensitive, so the retrieval timestamp is included.
+    Improvements over the previous version:
+      - Parses the MCP content-block/JSON response instead of dumping
+        raw tool output into the result shown to the user.
+      - Produces a clean, human-readable summary.
+      - Also returns a structured `weather_analysis` dict so downstream
+        agents (budget, itinerary) can consume real fields instead of
+        re-parsing a text blob.
+      - Degrades gracefully (with the raw evidence preserved) if the
+        MCP payload can't be parsed, instead of silently failing or
+        crashing.
+      - Catches tool failures locally since weather is non-critical
+        evidence; the rest of the plan can proceed without it.
     """
 
-    constraints = state.get(
-        "trip_constraints",
-        {},
-    ) or {}
+    constraints = (
+        state.get(
+            "trip_constraints",
+            {},
+        )
+        or {}
+    )
 
     city = str(
         constraints.get(
@@ -1086,9 +1135,8 @@ async def weather_agent(state: TravelState):
                 "Weather information could not be retrieved because "
                 "the destination was not identified."
             ),
-            "messages": _message(
-                "Weather agent could not identify destination."
-            ),
+            "weather_analysis": {},
+            "messages": _message("Weather agent could not identify destination."),
         }
 
     logger.info(
@@ -1096,38 +1144,143 @@ async def weather_agent(state: TravelState):
         city,
     )
 
-    weather_data, forecast_data = await asyncio.gather(
-        _tool_call_async(
-            current_weather,
-            city,
-            tool_name="current_weather",
-        ),
-        _tool_call_async(
-            forecast,
-            city,
-            tool_name="forecast",
-        ),
-    )
+    try:
+        weather_raw, forecast_raw = await asyncio.gather(
+            _tool_call_async(
+                current_weather,
+                city,
+                tool_name="current_weather",
+            ),
+            _tool_call_async(
+                forecast,
+                city,
+                tool_name="forecast",
+            ),
+        )
+    except Exception as exc:
+        logger.error(
+            "Weather agent tool call failed: %s",
+            exc,
+        )
+
+        return {
+            "weather_results": (
+                f"Weather data for {city} could not be retrieved due "
+                "to a tool error. Proceed with general seasonal "
+                "assumptions and verify conditions closer to departure."
+            ),
+            "weather_analysis": {},
+            "messages": _message(
+                "Weather agent tool call failed; continuing without live weather data."
+            ),
+        }
 
     retrieved_at = _utc_now()
 
-    result = (
-        "Current weather:\n"
-        f"{_truncate(weather_data, 1100)}\n\n"
-        "Forecast:\n"
-        f"{_truncate(forecast_data, 1500)}\n\n"
-        f"Retrieved at: {retrieved_at}\n"
-        "Weather data is time-sensitive; verify near departure."
-    )
+    weather_data = _parse_mcp_json(weather_raw)
+    forecast_data = _parse_mcp_json(forecast_raw)
+
+    current = weather_data if isinstance(weather_data, dict) else {}
+
+    forecast_days: list[dict] = []
+
+    if isinstance(forecast_data, dict):
+        raw_days = forecast_data.get("forecast", [])
+        forecast_days = (
+            [d for d in raw_days if isinstance(d, dict)]
+            if isinstance(raw_days, list)
+            else []
+        )
+    elif isinstance(forecast_data, list):
+        forecast_days = [d for d in forecast_data if isinstance(d, dict)]
+
+    parsed_ok = bool(current) or bool(forecast_days)
+
+    weather_analysis: dict[str, Any] = {
+        "city": current.get("city", city),
+        "temperature_c": (
+            _safe_float(current.get("temperature_c"))
+            if "temperature_c" in current
+            else None
+        ),
+        "feels_like_c": (
+            _safe_float(current.get("feels_like_c"))
+            if "feels_like_c" in current
+            else None
+        ),
+        "humidity": current.get("humidity"),
+        "condition": str(current.get("condition", "")).strip(),
+        "wind_speed": (
+            _safe_float(current.get("wind_speed")) if "wind_speed" in current else None
+        ),
+        "forecast": [
+            {
+                "datetime": str(day.get("datetime", "")),
+                "temperature": _safe_float(day.get("temperature")),
+                "weather": str(day.get("weather", "")).strip(),
+            }
+            for day in forecast_days
+        ],
+    }
+
+    if parsed_ok:
+        lines = [f"Current weather in {weather_analysis['city']}:"]
+
+        if weather_analysis["condition"]:
+            lines.append(f"- Condition: {weather_analysis['condition'].capitalize()}")
+
+        if weather_analysis["temperature_c"] is not None:
+            feels = weather_analysis["feels_like_c"]
+            feels_txt = f" (feels like {feels:.1f}°C)" if feels is not None else ""
+            lines.append(
+                f"- Temperature: {weather_analysis['temperature_c']:.1f}°C{feels_txt}"
+            )
+
+        if weather_analysis["humidity"] is not None:
+            lines.append(f"- Humidity: {weather_analysis['humidity']}%")
+
+        if weather_analysis["wind_speed"] is not None:
+            lines.append(f"- Wind speed: {weather_analysis['wind_speed']:.1f} m/s")
+
+        if weather_analysis["forecast"]:
+            lines.append("\nForecast:")
+
+            for day in weather_analysis["forecast"][:5]:
+                date_label = (
+                    day["datetime"].split(" ")[0] if day["datetime"] else "Unknown date"
+                )
+                lines.append(
+                    f"- {date_label}: {_format_temp(day['temperature'])}, "
+                    f"{day['weather'].capitalize() or 'No data'}"
+                )
+        else:
+            lines.append("\nForecast: not available.")
+
+        result = "\n".join(lines)
+    else:
+        logger.warning(
+            "Weather agent: could not parse MCP payload for city=%s",
+            city,
+        )
+
+        result = (
+            f"Weather data for {city} was returned in an unexpected "
+            "format and could not be fully parsed. Raw evidence "
+            "(for debugging):\n"
+            f"{_truncate(_extract_mcp_text(weather_raw), 500)}\n"
+            f"{_truncate(_extract_mcp_text(forecast_raw), 500)}"
+        )
+
+    result += f"\n\nRetrieved at: {retrieved_at}"
+    result += "\nWeather data is time-sensitive; verify near departure."
 
     return {
         "weather_results": _truncate(
             result,
             MAX_SPECIALIST_OUTPUT_CHARS,
         ),
-        "messages": _message(
-            "Weather agent completed using current MCP weather data."
-        ),
+        "weather_analysis": weather_analysis,
+        "messages": _message("Weather agent completed using current MCP weather data."),
         "llm_calls": _increment_llm_calls(state),
     }
 
@@ -1160,9 +1313,7 @@ def _validate_budget(
     violations: list[str] = []
 
     if analysis.total_cost < 0:
-        violations.append(
-            "Budget total cannot be negative."
-        )
+        violations.append("Budget total cannot be negative.")
 
     if any(
         value < 0
@@ -1173,14 +1324,10 @@ def _validate_budget(
             categories.activities,
         ]
     ):
-        violations.append(
-            "Budget categories cannot contain negative values."
-        )
+        violations.append("Budget categories cannot contain negative values.")
 
     if analysis.total_cost > 0:
-        difference = abs(
-            calculated_total - analysis.total_cost
-        )
+        difference = abs(calculated_total - analysis.total_cost)
 
         tolerance = max(
             100.0,
@@ -1188,14 +1335,10 @@ def _validate_budget(
         )
 
         if difference > tolerance:
-            violations.append(
-                "Budget total does not match the category breakdown."
-            )
+            violations.append("Budget total does not match the category breakdown.")
 
     if not analysis.currency:
-        warnings.append(
-            "Budget currency was not explicitly established."
-        )
+        warnings.append("Budget currency was not explicitly established.")
 
     return ValidationResult(
         passed=not violations,
@@ -1220,10 +1363,13 @@ def budget_agent(state: TravelState):
       - no silent empty-analysis fallback
     """
 
-    constraints = state.get(
-        "trip_constraints",
-        {},
-    ) or {}
+    constraints = (
+        state.get(
+            "trip_constraints",
+            {},
+        )
+        or {}
+    )
 
     prompt = f"""
 Analyze whether this trip is financially realistic.
@@ -1265,9 +1411,7 @@ Rules:
         prompt,
     )
 
-    validation = _validate_budget(
-        analysis
-    )
+    validation = _validate_budget(analysis)
 
     # --------------------------------------------------------
     # One targeted repair attempt if arithmetic is inconsistent.
@@ -1298,9 +1442,7 @@ Return a corrected structured budget analysis.
             repair_prompt,
         )
 
-        validation = _validate_budget(
-            analysis
-        )
+        validation = _validate_budget(analysis)
 
     # --------------------------------------------------------
     # Hard safety fallback.
@@ -1319,9 +1461,7 @@ Return a corrected structured budget analysis.
                 "verification before relying on the estimate."
             ),
             "budget_analysis": {},
-            "messages": _message(
-                "Budget analysis requires verification."
-            ),
+            "messages": _message("Budget analysis requires verification."),
             "llm_calls": _increment_llm_calls(
                 state,
                 2,
@@ -1335,21 +1475,12 @@ Return a corrected structured budget analysis.
             _safe_float(analysis.total_cost),
             2,
         ),
-        "currency": (
-            analysis.currency
-            or DEFAULT_CURRENCY
-        ),
+        "currency": (analysis.currency or DEFAULT_CURRENCY),
         "categories": categories,
         "risk_areas": analysis.risk_areas,
-        "money_saving_suggestions": (
-            analysis.money_saving_suggestions
-        ),
-        "feasible": bool(
-            analysis.feasible
-        ),
-        "confidence": _normalize_confidence(
-            analysis.confidence
-        ),
+        "money_saving_suggestions": (analysis.money_saving_suggestions),
+        "feasible": bool(analysis.feasible),
+        "confidence": _normalize_confidence(analysis.confidence),
     }
 
     narrative = analysis.narrative.strip()
@@ -1361,9 +1492,7 @@ Return a corrected structured budget analysis.
             f"{budget_analysis['total_cost']:.2f}."
         )
 
-    narrative += (
-        "\n\nBudget validation: PASS."
-    )
+    narrative += "\n\nBudget validation: PASS."
 
     return {
         "budget_results": _truncate(
@@ -1371,9 +1500,7 @@ Return a corrected structured budget analysis.
             MAX_SPECIALIST_OUTPUT_CHARS,
         ),
         "budget_analysis": budget_analysis,
-        "messages": _message(
-            "Budget agent completed with deterministic validation."
-        ),
+        "messages": _message("Budget agent completed with deterministic validation."),
         "llm_calls": _increment_llm_calls(
             state,
             1,
@@ -1394,10 +1521,13 @@ def prepare_replan(state: TravelState):
     every specialist.
     """
 
-    verdict = state.get(
-        "critic_verdict",
-        {},
-    ) or {}
+    verdict = (
+        state.get(
+            "critic_verdict",
+            {},
+        )
+        or {}
+    )
 
     responsible = [
         agent
@@ -1409,9 +1539,7 @@ def prepare_replan(state: TravelState):
     ]
 
     # Defensive deduplication.
-    responsible = list(
-        dict.fromkeys(responsible)
-    )
+    responsible = list(dict.fromkeys(responsible))
 
     logger.warning(
         "Preparing targeted replan: %s",
@@ -1429,10 +1557,7 @@ def prepare_replan(state: TravelState):
         "selected_agents": selected,
         "is_replan": True,
         "unresolved_violations": [],
-        "messages": _message(
-            "Targeted replan prepared for: "
-            + ", ".join(selected)
-        ),
+        "messages": _message("Targeted replan prepared for: " + ", ".join(selected)),
     }
 
 
@@ -1444,10 +1569,13 @@ def mark_unresolved(state: TravelState):
     violations so the human approval stage can see them.
     """
 
-    verdict = state.get(
-        "critic_verdict",
-        {},
-    ) or {}
+    verdict = (
+        state.get(
+            "critic_verdict",
+            {},
+        )
+        or {}
+    )
 
     violations = verdict.get(
         "violations",
@@ -1455,8 +1583,7 @@ def mark_unresolved(state: TravelState):
     )
 
     logger.warning(
-        "Maximum critic iterations reached. "
-        "Unresolved violations=%s",
+        "Maximum critic iterations reached. Unresolved violations=%s",
         violations,
     )
 
@@ -1485,15 +1612,29 @@ def itinerary_agent(state: TravelState):
       - assumptions
     """
 
-    constraints = state.get(
-        "trip_constraints",
-        {},
-    ) or {}
+    constraints = (
+        state.get(
+            "trip_constraints",
+            {},
+        )
+        or {}
+    )
 
-    budget_analysis = state.get(
-        "budget_analysis",
-        {},
-    ) or {}
+    budget_analysis = (
+        state.get(
+            "budget_analysis",
+            {},
+        )
+        or {}
+    )
+
+    weather_analysis = (
+        state.get(
+            "weather_analysis",
+            {},
+        )
+        or {}
+    )
 
     prompt = f"""
 Create a practical draft travel itinerary.
@@ -1512,6 +1653,9 @@ HOTEL EVIDENCE:
 
 WEATHER EVIDENCE:
 {_truncate(state.get("weather_results", ""), 1000)}
+
+STRUCTURED WEATHER:
+{_truncate(weather_analysis, 800)}
 
 BUDGET EVIDENCE:
 {_truncate(state.get("budget_results", ""), 1400)}
@@ -1579,9 +1723,7 @@ CRITICAL GROUNDING RULES:
 
     for phrase in suspicious_booking_phrases:
         if phrase in lowered:
-            warnings.append(
-                f"Potential unsupported booking claim: '{phrase}'."
-            )
+            warnings.append(f"Potential unsupported booking claim: '{phrase}'.")
 
     if warnings:
         logger.warning(
@@ -1610,9 +1752,7 @@ If you reject it, provide specific corrections.
     return {
         "itinerary": result,
         "approval_request": approval_request,
-        "messages": _message(
-            "Draft itinerary created for review."
-        ),
+        "messages": _message("Draft itinerary created for review."),
         "llm_calls": _increment_llm_calls(state),
     }
 
@@ -1629,10 +1769,13 @@ def human_approval_agent(state: TravelState):
     Unresolved critic violations are explicitly surfaced to the human.
     """
 
-    unresolved = state.get(
-        "unresolved_violations",
-        [],
-    ) or []
+    unresolved = (
+        state.get(
+            "unresolved_violations",
+            [],
+        )
+        or []
+    )
 
     approval_request = state.get(
         "approval_request",
@@ -1643,17 +1786,13 @@ def human_approval_agent(state: TravelState):
         approval_request = (
             approval_request
             + "\n\nUNRESOLVED SYSTEM WARNINGS:\n"
-            + "\n".join(
-                f"- {item}"
-                for item in unresolved
-            )
+            + "\n".join(f"- {item}" for item in unresolved)
         )
 
     feedback = interrupt(
         {
             "question": (
-                "Do you approve this itinerary? "
-                "Please review any unresolved warnings."
+                "Do you approve this itinerary? Please review any unresolved warnings."
             ),
             "draft_itinerary": state.get(
                 "itinerary",
@@ -1663,17 +1802,13 @@ def human_approval_agent(state: TravelState):
             "unresolved_violations": unresolved,
             "expected_response": {
                 "approved": True,
-                "feedback": (
-                    "Optional feedback for revision"
-                ),
+                "feedback": ("Optional feedback for revision"),
             },
         }
     )
 
     if not isinstance(feedback, dict):
-        raise ValueError(
-            "Human approval response must be a dictionary."
-        )
+        raise ValueError("Human approval response must be a dictionary.")
 
     approved = bool(
         feedback.get(
@@ -1697,9 +1832,7 @@ def human_approval_agent(state: TravelState):
     return {
         "approved": approved,
         "human_feedback": human_feedback,
-        "messages": _message(
-            "Human approval step completed."
-        ),
+        "messages": _message("Human approval step completed."),
     }
 
 
@@ -1737,15 +1870,21 @@ def final_response_agent(state: TravelState):
         )
     )
 
-    unresolved = state.get(
-        "unresolved_violations",
-        [],
-    ) or []
+    unresolved = (
+        state.get(
+            "unresolved_violations",
+            [],
+        )
+        or []
+    )
 
-    budget_analysis = state.get(
-        "budget_analysis",
-        {},
-    ) or {}
+    budget_analysis = (
+        state.get(
+            "budget_analysis",
+            {},
+        )
+        or {}
+    )
 
     if approved:
         mode_instruction = """
@@ -1842,11 +1981,7 @@ FINAL GROUNDING RULES:
 
     lowered = result.lower()
 
-    detected = [
-        phrase
-        for phrase in forbidden_claims
-        if phrase in lowered
-    ]
+    detected = [phrase for phrase in forbidden_claims if phrase in lowered]
 
     if detected:
         logger.warning(
@@ -1874,20 +2009,13 @@ Rules:
 """
 
         result = _llm_text(
-            (
-                "You are a strict output-safety editor for travel "
-                "planning."
-            ),
+            ("You are a strict output-safety editor for travel planning."),
             repair_prompt,
             retries=1,
         )
 
     return {
         "final_response": result,
-        "messages": [
-            AIMessage(
-                content=result
-            )
-        ],
+        "messages": [AIMessage(content=result)],
         "llm_calls": _increment_llm_calls(state),
     }

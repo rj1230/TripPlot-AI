@@ -36,10 +36,7 @@ from graph import run_graph
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
-from reportlab.lib.styles import (
-    ParagraphStyle,
-    getSampleStyleSheet,
-)
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import inch
 from reportlab.platypus import (
     HRFlowable,
@@ -110,6 +107,11 @@ RESULT_KEY_FOR_AGENT = {
     "itinerary_agent": "itinerary",
 }
 
+# Kept as a named constant instead of a magic number in the render call
+# so the quality-gate display and the actual graph limit can't silently
+# drift apart.
+MAX_ITERATIONS = 3
+
 
 # ============================================================
 # SESSION STATE
@@ -117,7 +119,6 @@ RESULT_KEY_FOR_AGENT = {
 
 
 def initialize_session_state() -> None:
-
     defaults = {
         "thread_id": f"demo_user_{uuid.uuid4().hex[:8]}",
         "user_query": "",
@@ -125,7 +126,6 @@ def initialize_session_state() -> None:
         "waiting_for_approval": False,
         "user_id": "demo_user",
     }
-
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
@@ -140,53 +140,30 @@ initialize_session_state()
 
 
 def safe_html(value: Any) -> str:
-    """
-    Escape arbitrary/LLM-generated content before inserting into
-    custom HTML.
-    """
-
+    """Escape arbitrary/LLM-generated content before inserting into custom HTML."""
     if value is None:
         return ""
-
-    return escape(
-        str(value),
-        quote=True,
-    )
+    return escape(str(value), quote=True)
 
 
 def safe_multiline_html(value: Any) -> str:
-    """
-    Escape content while preserving line breaks for HTML rendering.
-    """
-
+    """Escape content while preserving line breaks for HTML rendering."""
     text = safe_html(value)
-
-    return text.replace(
-        "\n",
-        "<br>",
-    )
+    return text.replace("\n", "<br>")
 
 
 def render_html(html: str) -> None:
     """
     Render custom HTML safely.
-
     Leading indentation is stripped because Streamlit Markdown
     interprets 4+ leading spaces as code blocks.
     """
-
     lines = html.split("\n")
-
     dedented = "\n".join(line.lstrip() for line in lines)
-
-    st.markdown(
-        dedented,
-        unsafe_allow_html=True,
-    )
+    st.markdown(dedented, unsafe_allow_html=True)
 
 
 def section_label(text: str) -> None:
-
     render_html(
         f"""
 <div class="section-label-row">
@@ -198,115 +175,202 @@ def section_label(text: str) -> None:
 
 
 # ============================================================
+# MARKDOWN RENDERING (safe: escapes first, then applies known
+# markdown syntax — bold/italic/headers/bullets/pipe-tables).
+# Fixes itinerary/final-response text showing raw "**"/"|---|"
+# markdown syntax instead of rendered formatting.
+# ============================================================
+
+
+def _inline_md(text: str) -> str:
+    """Escape text for HTML safety, then apply bold/italic markdown."""
+    escaped = safe_html(text)
+    escaped = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
+    escaped = re.sub(r"(?<!\*)\*(?!\*)(.+?)\*(?!\*)", r"<em>\1</em>", escaped)
+    return escaped
+
+
+def _flush_table(rows: list[list[str]]) -> str:
+    if not rows:
+        return ""
+    header, *body = rows
+    thead = "".join(f"<th>{_inline_md(c)}</th>" for c in header)
+    trs = "".join(
+        "<tr>" + "".join(f"<td>{_inline_md(c)}</td>" for c in row) + "</tr>"
+        for row in body
+    )
+    return (
+        f'<table class="md-table"><thead><tr>{thead}</tr></thead>'
+        f"<tbody>{trs}</tbody></table>"
+    )
+
+
+def render_markdown_html(text: Any) -> str:
+    """
+    Convert a small, known subset of markdown (headers, bullets, bold/italic,
+    pipe tables) into safe HTML. Every piece of text passes through
+    _inline_md -> safe_html first, so this carries no more XSS risk than
+    safe_multiline_html did — it just also renders structure instead of
+    dumping raw markdown syntax as literal text.
+    """
+    text = "" if text is None else str(text)
+
+    if not text.strip():
+        return '<span style="opacity:0.6;">No content available.</span>'
+
+    html_parts: list[str] = []
+    table_rows: list[list[str]] = []
+    in_table = False
+    in_list = False
+
+    def flush_table():
+        nonlocal table_rows, in_table
+        if table_rows:
+            html_parts.append(_flush_table(table_rows))
+        table_rows = []
+        in_table = False
+
+    def flush_list():
+        nonlocal in_list
+        if in_list:
+            html_parts.append("</ul>")
+        in_list = False
+
+    for raw_line in text.split("\n"):
+        line = raw_line.strip()
+
+        if not line:
+            flush_table()
+            flush_list()
+            continue
+
+        # Pipe table row
+        if line.startswith("|") and line.endswith("|"):
+            if re.match(r"^\|[\s\-:|]+\|$", line):
+                continue  # separator row, e.g. |---|---|
+            table_rows.append([c.strip() for c in line.strip("|").split("|")])
+            in_table = True
+            continue
+        flush_table()
+
+        if line.startswith("### "):
+            flush_list()
+            html_parts.append(f"<h4>{_inline_md(line[4:])}</h4>")
+            continue
+        if line.startswith("## "):
+            flush_list()
+            html_parts.append(f"<h3>{_inline_md(line[3:])}</h3>")
+            continue
+        if line.startswith("# "):
+            flush_list()
+            html_parts.append(f"<h2>{_inline_md(line[2:])}</h2>")
+            continue
+
+        if line.startswith(("- ", "* ")):
+            if not in_list:
+                html_parts.append("<ul>")
+                in_list = True
+            html_parts.append(f"<li>{_inline_md(line[2:])}</li>")
+            continue
+        flush_list()
+
+        if line in ("---", "***", "___"):
+            html_parts.append('<hr style="opacity:0.3;">')
+            continue
+
+        html_parts.append(f"<p>{_inline_md(line)}</p>")
+
+    flush_table()
+    flush_list()
+
+    return "\n".join(html_parts)
+
+
+def format_agent_content(content: Any) -> str:
+    """
+    Format an agent's raw result for display. Handles the case where an
+    agent (e.g. weather_agent) returns a structured dict/list straight from
+    an API instead of a pre-formatted string, so the UI never shows a raw
+    Python/JSON repr like {'temp': 28, 'condition': 'Light rain'}.
+    """
+    if isinstance(content, dict):
+        if not content:
+            return '<span style="opacity:0.6;">No data returned.</span>'
+        return "".join(
+            f'<div class="dimension-row">'
+            f'<span class="dimension-name">{safe_html(str(k).replace("_", " ").title())}</span>'
+            f'<span class="dimension-score">{safe_html(v)}</span>'
+            f"</div>"
+            for k, v in content.items()
+        )
+
+    if isinstance(content, list):
+        if not content:
+            return '<span style="opacity:0.6;">No data returned.</span>'
+        # List of dicts (e.g. multi-day forecast) -> one mini block per item
+        if content and isinstance(content[0], dict):
+            return "".join(
+                format_agent_content(item) + "<hr style='opacity:0.15;'>"
+                for item in content
+            )
+        return "".join(
+            f'<div style="padding:4px 0;">• {safe_html(item)}</div>' for item in content
+        )
+
+    return render_markdown_html(content)
+
+
+# ============================================================
 # GENERIC HELPERS
 # ============================================================
 
 
 def as_dict(value: Any) -> dict[str, Any]:
-
     if isinstance(value, dict):
         return value
-
     return {}
 
 
 def as_list(value: Any) -> list[Any]:
-
     if isinstance(value, list):
         return value
-
     if value is None:
         return []
-
     return [value]
 
 
-def get_critic_verdict(
-    result: dict[str, Any],
-) -> dict[str, Any]:
-
-    verdict = result.get(
-        "critic_verdict",
-        {},
-    )
-
-    return as_dict(verdict)
+def get_critic_verdict(result: dict[str, Any]) -> dict[str, Any]:
+    return as_dict(result.get("critic_verdict", {}))
 
 
-def get_critic_scores(
-    result: dict[str, Any],
-) -> dict[str, Any]:
-
+def get_critic_scores(result: dict[str, Any]) -> dict[str, Any]:
     verdict = get_critic_verdict(result)
-
-    scores = verdict.get(
-        "scores",
-        {},
-    )
-
-    return as_dict(scores)
+    return as_dict(verdict.get("scores", {}))
 
 
-def get_iteration(
-    result: dict[str, Any],
-) -> int:
-
+def get_iteration(result: dict[str, Any]) -> int:
     try:
-        return max(
-            0,
-            int(
-                result.get(
-                    "iteration_count",
-                    0,
-                )
-                or 0
-            ),
-        )
+        return max(0, int(result.get("iteration_count", 0) or 0))
     except (TypeError, ValueError):
         return 0
 
 
-def get_decision(
-    result: dict[str, Any],
-) -> str:
-
+def get_decision(result: dict[str, Any]) -> str:
     verdict = get_critic_verdict(result)
-
-    decision = (
-        str(
-            verdict.get(
-                "decision",
-                "",
-            )
-        )
-        .upper()
-        .strip()
-    )
-
+    decision = str(verdict.get("decision", "")).upper().strip()
     if decision:
         return decision
-
     if verdict.get("passed"):
         return "PASS"
-
     return "REPLAN"
 
 
-def get_selected_agents(
-    result: dict[str, Any],
-) -> list[str]:
-
-    selected = result.get(
-        "selected_agents",
-        [],
-    )
-
-    if not isinstance(
-        selected,
-        list,
-    ):
+def get_selected_agents(result: dict[str, Any] | None) -> list[str]:
+    if not result:
         return []
-
+    selected = result.get("selected_agents", [])
+    if not isinstance(selected, list):
+        return []
     return [agent for agent in AGENT_ORDER if agent in selected]
 
 
@@ -316,76 +380,42 @@ def get_selected_agents(
 
 
 def _clean_for_pdf(text: Any) -> str:
-
     if text is None:
         return ""
-
     text = str(text)
-
-    # Remove HTML tags.
-    text = re.sub(
-        r"<[^>]+>",
-        "",
-        text,
-    )
-
-    # Basic HTML entities.
+    text = re.sub(r"<[^>]+>", "", text)
     text = (
         text.replace("&nbsp;", " ")
         .replace("&amp;", "&")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
     )
-
     return text.strip()
 
 
 def _pdf_escape(text: Any) -> str:
-
-    return escape(
-        _clean_for_pdf(text),
-        quote=False,
-    )
+    return escape(_clean_for_pdf(text), quote=False)
 
 
-def _markdown_to_flowables(
-    text: str,
-    styles: dict[str, ParagraphStyle],
-):
-
+def _markdown_to_flowables(text: str, styles: dict[str, ParagraphStyle]):
     flowables = []
-
     text = _clean_for_pdf(text)
 
     if not text:
-        flowables.append(
-            Paragraph(
-                "<i>No content available.</i>",
-                styles["PlanBody"],
-            )
-        )
-
+        flowables.append(Paragraph("<i>No content available.</i>", styles["PlanBody"]))
         return flowables
 
     lines = text.split("\n")
-
     bullet_buffer: list[str] = []
 
     def flush_bullets():
-
         if not bullet_buffer:
             return
-
         for bullet in bullet_buffer:
             safe_bullet = _pdf_escape(bullet)
-
             flowables.append(
-                Paragraph(
-                    f"&bull;&nbsp;&nbsp;{safe_bullet}",
-                    styles["PlanBullet"],
-                )
+                Paragraph(f"&bull;&nbsp;&nbsp;{safe_bullet}", styles["PlanBullet"])
             )
-
         bullet_buffer.clear()
 
     for raw_line in lines:
@@ -393,114 +423,43 @@ def _markdown_to_flowables(
 
         if not line:
             flush_bullets()
-
-            flowables.append(
-                Spacer(
-                    1,
-                    4,
-                )
-            )
-
+            flowables.append(Spacer(1, 4))
             continue
-
-        # ----------------------------------------------------
-        # Extract heading level before escaping.
-        # ----------------------------------------------------
 
         if line.startswith("### "):
             flush_bullets()
-
-            flowables.append(
-                Paragraph(
-                    _pdf_escape(line[4:]),
-                    styles["PlanH3"],
-                )
-            )
-
+            flowables.append(Paragraph(_pdf_escape(line[4:]), styles["PlanH3"]))
             continue
 
         if line.startswith("## "):
             flush_bullets()
-
-            flowables.append(
-                Paragraph(
-                    _pdf_escape(line[3:]),
-                    styles["PlanH2"],
-                )
-            )
-
+            flowables.append(Paragraph(_pdf_escape(line[3:]), styles["PlanH2"]))
             continue
 
         if line.startswith("# "):
             flush_bullets()
-
-            flowables.append(
-                Paragraph(
-                    _pdf_escape(line[2:]),
-                    styles["PlanH1"],
-                )
-            )
-
+            flowables.append(Paragraph(_pdf_escape(line[2:]), styles["PlanH1"]))
             continue
 
-        # ----------------------------------------------------
-        # Bullet
-        # ----------------------------------------------------
-
-        if line.startswith(
-            (
-                "- ",
-                "* ",
-            )
-        ):
+        if line.startswith(("- ", "* ")):
             bullet_buffer.append(line[2:])
-
             continue
 
-        # ----------------------------------------------------
-        # Numbered list
-        # ----------------------------------------------------
-
-        if re.match(
-            r"^\d+\.\s",
-            line,
-        ):
+        if re.match(r"^\d+\.\s", line):
             flush_bullets()
-
-            flowables.append(
-                Paragraph(
-                    _pdf_escape(line),
-                    styles["PlanBullet"],
-                )
-            )
-
+            flowables.append(Paragraph(_pdf_escape(line), styles["PlanBullet"]))
             continue
-
-        # ----------------------------------------------------
-        # Normal paragraph
-        # ----------------------------------------------------
 
         flush_bullets()
-
-        flowables.append(
-            Paragraph(
-                _pdf_escape(line),
-                styles["PlanBody"],
-            )
-        )
+        flowables.append(Paragraph(_pdf_escape(line), styles["PlanBody"]))
 
     flush_bullets()
-
     return flowables
 
 
 def build_travel_plan_pdf(
-    result: dict,
-    user_id: str,
-    thread_id: str,
-    user_query: str,
+    result: dict, user_id: str, thread_id: str, user_query: str
 ) -> bytes:
-
     buffer = io.BytesIO()
 
     document = SimpleDocTemplate(
@@ -597,292 +556,89 @@ def build_travel_plan_pdf(
     story = []
 
     verdict = get_critic_verdict(result)
-
     decision = get_decision(result)
-
     quality_score = verdict.get("quality_score")
-
     confidence = verdict.get("confidence")
-
     iteration = get_iteration(result)
 
-    # ========================================================
-    # TITLE
-    # ========================================================
-
-    story.append(
-        Paragraph(
-            "Your Travel Plan",
-            styles["TitleMain"],
-        )
-    )
+    story.append(Paragraph("Your Travel Plan", styles["TitleMain"]))
 
     generated_at = datetime.now().strftime("%d %b %Y, %I:%M %p")
-
     metadata = (
-        f"Generated {generated_at}"
-        f" &nbsp;|&nbsp; "
-        f"User: {_pdf_escape(user_id)}"
-        f" &nbsp;|&nbsp; "
+        f"Generated {generated_at} &nbsp;|&nbsp; "
+        f"User: {_pdf_escape(user_id)} &nbsp;|&nbsp; "
         f"Thread: {_pdf_escape(thread_id)}"
     )
-
+    story.append(Paragraph(metadata, styles["Subtitle"]))
     story.append(
-        Paragraph(
-            metadata,
-            styles["Subtitle"],
-        )
+        HRFlowable(width="100%", color=colors.HexColor("#D8DCE6"), thickness=1)
     )
+    story.append(Spacer(1, 10))
 
-    story.append(
-        HRFlowable(
-            width="100%",
-            color=colors.HexColor("#D8DCE6"),
-            thickness=1,
-        )
-    )
-
-    story.append(
-        Spacer(
-            1,
-            10,
-        )
-    )
-
-    # ========================================================
-    # QUALITY STATUS
-    # ========================================================
-
-    story.append(
-        Paragraph(
-            "Quality Gate",
-            styles["SectionHeader"],
-        )
-    )
-
+    story.append(Paragraph("Quality Gate", styles["SectionHeader"]))
     quality_text = (
-        f"Decision: {decision}"
-        f" &nbsp;|&nbsp; "
-        f"Quality: {quality_score if quality_score is not None else 'N/A'}"
-        f" &nbsp;|&nbsp; "
-        f"Confidence: {confidence if confidence is not None else 'N/A'}"
-        f" &nbsp;|&nbsp; "
+        f"Decision: {decision} &nbsp;|&nbsp; "
+        f"Quality: {quality_score if quality_score is not None else 'N/A'} &nbsp;|&nbsp; "
+        f"Confidence: {confidence if confidence is not None else 'N/A'} &nbsp;|&nbsp; "
         f"Iteration: {iteration}"
     )
+    story.append(Paragraph(quality_text, styles["PlanBody"]))
 
-    story.append(
-        Paragraph(
-            quality_text,
-            styles["PlanBody"],
-        )
-    )
-
-    # ========================================================
-    # REQUEST
-    # ========================================================
-
-    story.append(
-        Paragraph(
-            "Trip Request",
-            styles["SectionHeader"],
-        )
-    )
-
-    story.append(
-        Paragraph(
-            _pdf_escape(user_query) or "—",
-            styles["PlanBody"],
-        )
-    )
-
-    # ========================================================
-    # AGENTS
-    # ========================================================
+    story.append(Paragraph("Trip Request", styles["SectionHeader"]))
+    story.append(Paragraph(_pdf_escape(user_query) or "—", styles["PlanBody"]))
 
     selected_agents = get_selected_agents(result)
-
     if selected_agents:
-        story.append(
-            Paragraph(
-                "Agents Involved",
-                styles["SectionHeader"],
-            )
-        )
-
-        rows = [
-            [
-                "Agent",
-                "Role",
-            ]
-        ]
-
+        story.append(Paragraph("Agents Involved", styles["SectionHeader"]))
+        rows = [["Agent", "Role"]]
         for key in AGENT_ORDER:
             if key not in selected_agents:
                 continue
-
             meta = AGENT_META[key]
+            rows.append([_pdf_escape(meta["label"]), _pdf_escape(meta["desc"])])
 
-            rows.append(
-                [
-                    _pdf_escape(meta["label"]),
-                    _pdf_escape(meta["desc"]),
-                ]
-            )
-
-        table = Table(
-            rows,
-            colWidths=[
-                2.0 * inch,
-                4.3 * inch,
-            ],
-        )
-
+        table = Table(rows, colWidths=[2.0 * inch, 4.3 * inch])
         table.setStyle(
             TableStyle(
                 [
-                    (
-                        "BACKGROUND",
-                        (0, 0),
-                        (-1, 0),
-                        colors.HexColor("#EEF1F8"),
-                    ),
-                    (
-                        "TEXTCOLOR",
-                        (0, 0),
-                        (-1, 0),
-                        colors.HexColor("#2E3A59"),
-                    ),
-                    (
-                        "FONTNAME",
-                        (0, 0),
-                        (-1, 0),
-                        "Helvetica-Bold",
-                    ),
-                    (
-                        "FONTSIZE",
-                        (0, 0),
-                        (-1, -1),
-                        9.5,
-                    ),
-                    (
-                        "BOTTOMPADDING",
-                        (0, 0),
-                        (-1, -1),
-                        7,
-                    ),
-                    (
-                        "TOPPADDING",
-                        (0, 0),
-                        (-1, -1),
-                        7,
-                    ),
-                    (
-                        "GRID",
-                        (0, 0),
-                        (-1, -1),
-                        0.5,
-                        colors.HexColor("#E2E5EC"),
-                    ),
-                    (
-                        "VALIGN",
-                        (0, 0),
-                        (-1, -1),
-                        "TOP",
-                    ),
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#EEF1F8")),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#2E3A59")),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("FONTSIZE", (0, 0), (-1, -1), 9.5),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+                    ("TOPPADDING", (0, 0), (-1, -1), 7),
+                    ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#E2E5EC")),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
                 ]
             )
         )
-
         story.append(table)
 
-    # ========================================================
-    # ITINERARY
-    # ========================================================
-
-    itinerary = result.get(
-        "itinerary",
-        "",
-    )
-
+    itinerary = result.get("itinerary", "")
     if itinerary:
-        story.append(
-            Paragraph(
-                "Itinerary",
-                styles["SectionHeader"],
-            )
-        )
+        story.append(Paragraph("Itinerary", styles["SectionHeader"]))
+        story.extend(_markdown_to_flowables(itinerary, styles))
 
-        story.extend(
-            _markdown_to_flowables(
-                itinerary,
-                styles,
-            )
-        )
-
-    # ========================================================
-    # FINAL RESPONSE
-    # ========================================================
-
-    final_response = result.get(
-        "final_response",
-        "",
-    )
-
+    final_response = result.get("final_response", "")
     if final_response:
-        story.append(
-            Paragraph(
-                "Final Travel Plan",
-                styles["SectionHeader"],
-            )
-        )
+        story.append(Paragraph("Final Travel Plan", styles["SectionHeader"]))
+        story.extend(_markdown_to_flowables(final_response, styles))
 
-        story.extend(
-            _markdown_to_flowables(
-                final_response,
-                styles,
-            )
-        )
-
-    # ========================================================
-    # FOOTER
-    # ========================================================
-
+    story.append(Spacer(1, 16))
     story.append(
-        Spacer(
-            1,
-            16,
-        )
+        HRFlowable(width="100%", color=colors.HexColor("#D8DCE6"), thickness=1)
     )
-
-    story.append(
-        HRFlowable(
-            width="100%",
-            color=colors.HexColor("#D8DCE6"),
-            thickness=1,
-        )
-    )
-
-    story.append(
-        Spacer(
-            1,
-            6,
-        )
-    )
-
+    story.append(Spacer(1, 6))
     story.append(
         Paragraph(
-            "Generated by Multi-Agent Travel Planner — "
-            "Supervisor + Quality Gate + Human-in-the-Loop",
+            "Generated by Multi-Agent Travel Planner — Supervisor + Quality Gate + Human-in-the-Loop",
             styles["MetaLabel"],
         )
     )
 
     document.build(story)
-
     pdf_bytes = buffer.getvalue()
-
     buffer.close()
-
     return pdf_bytes
 
 
@@ -925,19 +681,15 @@ html, body, .stApp, .stApp p, .stMarkdown,
 
 .stApp {
     background:
-        radial-gradient(
-            circle at 12% -6%,
-            rgba(201,162,75,0.07) 0%,
-            transparent 40%
-        ),
-        repeating-linear-gradient(
-            120deg,
-            rgba(255,255,255,0.012) 0px,
-            rgba(255,255,255,0.012) 1px,
-            transparent 1px,
-            transparent 64px
-        ),
+        radial-gradient(circle at 12% -6%, rgba(201,162,75,0.07) 0%, transparent 40%),
+        repeating-linear-gradient(120deg, rgba(255,255,255,0.012) 0px, rgba(255,255,255,0.012) 1px, transparent 1px, transparent 64px),
         var(--ink);
+}
+
+/* Prevent the fixed chat-input bar from covering the last rows of
+   itinerary/report content. */
+.main .block-container {
+    padding-bottom: 7rem;
 }
 
 [data-testid="stSidebar"] {
@@ -1029,6 +781,40 @@ html, body, .stApp, .stApp p, .stMarkdown,
 }
 
 /* ============================================================
+   EMPTY STATE (shown before the first trip is planned)
+   ============================================================ */
+
+.empty-state {
+    text-align: center;
+    padding: 56px 24px;
+    border: 1px dashed var(--hairline-strong);
+    border-radius: 4px;
+    background: var(--panel);
+    margin-bottom: 30px;
+}
+
+.empty-state-icon {
+    font-size: 2.1rem;
+    margin-bottom: 10px;
+}
+
+.empty-state-title {
+    font-family: 'Fraunces', serif;
+    font-size: 1.25rem;
+    font-weight: 600;
+    color: var(--text);
+    margin-bottom: 8px;
+}
+
+.empty-state-sub {
+    color: var(--slate);
+    font-size: 0.88rem;
+    line-height: 1.6;
+    max-width: 460px;
+    margin: 0 auto;
+}
+
+/* ============================================================
    SECTION
    ============================================================ */
 
@@ -1066,6 +852,12 @@ html, body, .stApp, .stApp p, .stMarkdown,
     min-height: 175px;
     overflow: hidden;
     position: relative;
+    transition: border-color 0.15s ease, transform 0.15s ease;
+}
+
+.agent-card:hover {
+    border-color: var(--hairline-strong);
+    transform: translateY(-1px);
 }
 
 .agent-card.active {
@@ -1075,6 +867,10 @@ html, body, .stApp, .stApp p, .stMarkdown,
 
 .agent-card.inactive {
     opacity: 0.4;
+}
+
+.agent-card.inactive:hover {
+    transform: none;
 }
 
 .agent-card.replanned {
@@ -1148,6 +944,31 @@ html, body, .stApp, .stApp p, .stMarkdown,
     line-height: 1.4;
 }
 
+/* Status strip at the bottom of each agent card. Replaces the old
+   decorative "barcode" markup, which had no matching CSS and was
+   invisible — this version actually communicates the card's state:
+   solid accent = completed, solid coral = replanned this iteration,
+   faint hairline = skipped. */
+
+.agent-perf-bar {
+    height: 3px;
+    margin: 0 14px 14px 14px;
+    border-radius: 2px;
+    background: rgba(255,255,255,0.06);
+}
+
+.agent-perf-bar.on {
+    background: var(--accent);
+}
+
+.agent-perf-bar.warn {
+    background: var(--coral);
+}
+
+.agent-perf-bar.off {
+    background: rgba(255,255,255,0.06);
+}
+
 /* ============================================================
    PANELS
    ============================================================ */
@@ -1159,6 +980,11 @@ html, body, .stApp, .stApp p, .stMarkdown,
     padding-bottom: 16px;
     margin-bottom: 18px;
     overflow: hidden;
+    transition: border-color 0.15s ease;
+}
+
+.panel:hover {
+    border-color: var(--hairline-strong);
 }
 
 .panel-title {
@@ -1214,6 +1040,11 @@ html, body, .stApp, .stApp p, .stMarkdown,
     border: 1px solid var(--hairline);
     padding: 14px;
     border-radius: 3px;
+    transition: border-color 0.15s ease;
+}
+
+.quality-card:hover {
+    border-color: var(--hairline-strong);
 }
 
 .quality-label {
@@ -1229,23 +1060,13 @@ html, body, .stApp, .stApp p, .stMarkdown,
     font-size: 1.35rem;
     font-weight: 700;
     color: var(--text);
+    font-variant-numeric: tabular-nums;
 }
 
-.quality-pass {
-    color: #63D4A6 !important;
-}
-
-.quality-review {
-    color: var(--brass) !important;
-}
-
-.quality-replan {
-    color: #F0785D !important;
-}
-
-.quality-neutral {
-    color: var(--slate) !important;
-}
+.quality-pass { color: #63D4A6 !important; }
+.quality-review { color: var(--brass) !important; }
+.quality-replan { color: #F0785D !important; }
+.quality-neutral { color: var(--slate) !important; }
 
 .dimension-row {
     display: flex;
@@ -1264,6 +1085,7 @@ html, body, .stApp, .stApp p, .stMarkdown,
     font-family: 'IBM Plex Mono', monospace;
     font-size: 0.75rem;
     color: var(--brass);
+    font-variant-numeric: tabular-nums;
 }
 
 .warning-box {
@@ -1329,6 +1151,63 @@ html, body, .stApp, .stApp p, .stMarkdown,
     color: var(--parchment-ink) !important;
 }
 
+/* Rendered markdown inside the parchment blocks (draft/final plan) */
+.parchment h2, .parchment h3, .parchment h4 {
+    font-family: 'Fraunces', serif;
+    color: var(--parchment-ink);
+    margin: 14px 0 8px 0;
+}
+.parchment p {
+    margin: 0 0 8px 0;
+    line-height: 1.65;
+}
+.parchment ul {
+    margin: 0 0 10px 0;
+    padding-left: 22px;
+}
+.parchment li {
+    margin-bottom: 4px;
+    line-height: 1.55;
+}
+
+.md-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 10px 0 16px 0;
+    font-size: 0.85rem;
+}
+.md-table th, .md-table td {
+    border: 1px solid rgba(43,36,22,0.18);
+    padding: 6px 10px;
+    text-align: left;
+    vertical-align: top;
+}
+.md-table th {
+    background: rgba(43,36,22,0.06);
+    font-weight: 600;
+}
+
+/* ============================================================
+   SIDEBAR ROSTER
+   ============================================================ */
+
+.roster-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 999px;
+    background: rgba(255,255,255,0.12);
+    flex-shrink: 0;
+}
+
+.roster-row.roster-active .roster-dot {
+    background: var(--brass);
+    box-shadow: 0 0 0 3px rgba(201,162,75,0.18);
+}
+
+.roster-row.roster-active .roster-name {
+    color: var(--brass) !important;
+}
+
 /* ============================================================
    NATIVE WIDGETS
    ============================================================ */
@@ -1365,13 +1244,47 @@ hr {
     border-top: 1px dashed var(--hairline-strong) !important;
 }
 
+/* ============================================================
+   RESPONSIVE
+   ============================================================ */
+
 @media (max-width: 900px) {
     .quality-grid {
         grid-template-columns: repeat(2, 1fr);
     }
-
     .hero-title {
         font-size: 2rem;
+    }
+}
+
+@media (max-width: 700px) {
+    .hero-wrap {
+        padding: 22px 20px 18px 20px;
+    }
+    .hero-title {
+        font-size: 1.6rem;
+    }
+    .hero-sub {
+        font-size: 0.9rem;
+    }
+    .agent-card {
+        min-height: 150px;
+    }
+    .agent-name {
+        font-size: 0.92rem;
+    }
+    .agent-desc {
+        font-size: 0.72rem;
+    }
+    .parchment {
+        padding: 18px 18px;
+    }
+    .quality-grid {
+        grid-template-columns: repeat(2, 1fr);
+        gap: 8px;
+    }
+    .quality-value {
+        font-size: 1.1rem;
     }
 }
 
@@ -1382,63 +1295,47 @@ hr {
 
 
 # ============================================================
+# ACTIVE-AGENT LOOKUP (used by both the sidebar roster and the
+# main execution grid — computed once, early, so the sidebar can
+# reflect the most recent run instead of always looking static).
+# ============================================================
+
+_latest_for_sidebar = st.session_state.get("latest_result")
+_sidebar_active_agents = get_selected_agents(_latest_for_sidebar)
+
+
+# ============================================================
 # SIDEBAR
 # ============================================================
 
 with st.sidebar:
     render_html(
         """
-<div style="font-family:'IBM Plex Mono', monospace;
-            font-size:0.68rem;
-            letter-spacing:0.14em;
-            text-transform:uppercase;
-            color:#C9A24B;
-            margin-bottom:2px;">
+<div style="font-family:'IBM Plex Mono', monospace; font-size:0.68rem; letter-spacing:0.14em; text-transform:uppercase; color:#C9A24B; margin-bottom:2px;">
     Session
 </div>
-
-<div style="font-family:'Fraunces', serif;
-            font-size:1.2rem;
-            font-weight:600;
-            color:#ECEEF3;
-            margin-bottom:14px;">
+<div style="font-family:'Fraunces', serif; font-size:1.2rem; font-weight:600; color:#ECEEF3; margin-bottom:14px;">
     Passenger Details
 </div>
 """
     )
 
     user_id = st.text_input(
-        "User ID",
-        value=st.session_state.get(
-            "user_id",
-            "demo_user",
-        ),
+        "User ID", value=st.session_state.get("user_id", "demo_user")
     )
-
     st.session_state.user_id = user_id
 
-    if st.button(
-        "➕ New Thread",
-        use_container_width=True,
-    ):
+    if st.button("➕ New Thread", use_container_width=True):
         st.session_state.thread_id = f"{user_id}_{uuid.uuid4().hex[:8]}"
-
         st.session_state.latest_result = None
         st.session_state.user_query = ""
         st.session_state.waiting_for_approval = False
-
         st.rerun()
 
     render_html(
         f"""
-<div style="font-family:'IBM Plex Mono', monospace;
-            font-size:0.72rem;
-            color:#838C9E;
-            margin-top:10px;">
-    THREAD&nbsp;&nbsp;
-    <span style="color:#ECEEF3;">
-        {safe_html(st.session_state.thread_id)}
-    </span>
+<div style="font-family:'IBM Plex Mono', monospace; font-size:0.72rem; color:#838C9E; margin-top:10px;">
+    THREAD&nbsp;&nbsp;<span style="color:#ECEEF3;">{safe_html(st.session_state.thread_id)}</span>
 </div>
 """
     )
@@ -1447,20 +1344,10 @@ with st.sidebar:
 
     render_html(
         """
-<div style="font-family:'IBM Plex Mono', monospace;
-            font-size:0.68rem;
-            letter-spacing:0.14em;
-            text-transform:uppercase;
-            color:#C9A24B;
-            margin-bottom:2px;">
+<div style="font-family:'IBM Plex Mono', monospace; font-size:0.68rem; letter-spacing:0.14em; text-transform:uppercase; color:#C9A24B; margin-bottom:2px;">
     Roster
 </div>
-
-<div style="font-family:'Fraunces', serif;
-            font-size:1.2rem;
-            font-weight:600;
-            color:#ECEEF3;
-            margin-bottom:14px;">
+<div style="font-family:'Fraunces', serif; font-size:1.2rem; font-weight:600; color:#ECEEF3; margin-bottom:14px;">
     Specialist Agents
 </div>
 """
@@ -1468,39 +1355,30 @@ with st.sidebar:
 
     for index, key in enumerate(AGENT_ORDER):
         meta = AGENT_META[key]
+        is_active = key in _sidebar_active_agents
+        row_class = "roster-row roster-active" if is_active else "roster-row"
 
         render_html(
             f"""
-<div style="display:flex;
-            align-items:center;
-            gap:10px;
-            padding:8px 0;
-            border-bottom:1px dashed rgba(201,162,75,0.16);">
-
-    <div style="font-family:'IBM Plex Mono', monospace;
-                font-size:0.62rem;
-                color:#838C9E;
-                width:24px;">
+<div class="{row_class}" style="display:flex; align-items:center; gap:10px; padding:8px 0; border-bottom:1px dashed rgba(201,162,75,0.16);">
+    <div style="font-family:'IBM Plex Mono', monospace; font-size:0.62rem; color:#838C9E; width:24px;">
         0{index + 1}
     </div>
-
-    <div style="font-size:1.05rem;">
-        {meta["icon"]}
+    <div style="font-size:1.05rem;">{meta["icon"]}</div>
+    <div style="flex:1;">
+        <div class="roster-name" style="font-weight:600; font-size:0.85rem; color:#ECEEF3;">{safe_html(meta["label"])}</div>
+        <div style="font-size:0.72rem; color:#838C9E;">{safe_html(meta["desc"])}</div>
     </div>
+    <div class="roster-dot"></div>
+</div>
+"""
+        )
 
-    <div>
-        <div style="font-weight:600;
-                    font-size:0.85rem;
-                    color:#ECEEF3;">
-            {safe_html(meta["label"])}
-        </div>
-
-        <div style="font-size:0.72rem;
-                    color:#838C9E;">
-            {safe_html(meta["desc"])}
-        </div>
-    </div>
-
+    if _sidebar_active_agents:
+        render_html(
+            f"""
+<div style="font-family:'IBM Plex Mono', monospace; font-size:0.66rem; color:#838C9E; margin-top:10px;">
+    {len(_sidebar_active_agents)} of {len(AGENT_ORDER)} active in current thread
 </div>
 """
         )
@@ -1513,61 +1391,36 @@ with st.sidebar:
 render_html(
     """
 <div class="hero-wrap">
-
-    <div class="hero-eyebrow">
-        Itinerary Desk · Supervisor-Routed Planning
-    </div>
-
-    <div class="hero-title">
-        Multi-Agent Travel Planner
-    </div>
-
+    <div class="hero-eyebrow">Itinerary Desk · Supervisor-Routed Planning</div>
+    <div class="hero-title">Multi-Agent Travel Planner</div>
     <div class="hero-sub">
         Describe your trip. A supervisor routes the request to the
         specialists it needs, generates a plan, evaluates it through
         deterministic and semantic quality gates, and requests human
         approval before finalization.
     </div>
-
     <div class="ticket-row">
-
         <div class="ticket-field">
             <div class="ticket-label">Routing</div>
-            <div class="ticket-value">
-                Supervisor-directed
-            </div>
+            <div class="ticket-value">Supervisor-directed</div>
         </div>
-
         <div class="ticket-field">
             <div class="ticket-label">Quality</div>
-            <div class="ticket-value">
-                Critic + deterministic gates
-            </div>
+            <div class="ticket-value">Critic + deterministic gates</div>
         </div>
-
         <div class="ticket-field">
             <div class="ticket-label">Recovery</div>
-            <div class="ticket-value">
-                Targeted replanning
-            </div>
+            <div class="ticket-value">Targeted replanning</div>
         </div>
-
         <div class="ticket-field">
             <div class="ticket-label">Review</div>
-            <div class="ticket-value">
-                Human-in-the-loop
-            </div>
+            <div class="ticket-value">Human-in-the-loop</div>
         </div>
-
         <div class="ticket-field">
             <div class="ticket-label">Output</div>
-            <div class="ticket-value">
-                Plan + PDF
-            </div>
+            <div class="ticket-value">Plan + PDF</div>
         </div>
-
     </div>
-
 </div>
 """
 )
@@ -1577,11 +1430,7 @@ render_html(
 # LANGGRAPH CONFIG
 # ============================================================
 
-config = {
-    "configurable": {
-        "thread_id": st.session_state.thread_id,
-    }
-}
+config = {"configurable": {"thread_id": st.session_state.thread_id}}
 
 
 # ============================================================
@@ -1608,7 +1457,6 @@ if new_query:
         "messages": [HumanMessage(content=new_query)],
         "user_id": user_id,
         "user_query": new_query,
-        # Compatibility fields for current state/agents.
         "flight_results": "",
         "hotel_results": "",
         "weather_results": "",
@@ -1616,7 +1464,6 @@ if new_query:
         "itinerary": "",
         "final_response": "",
         "llm_calls": 0,
-        # New execution state defaults.
         "iteration_count": 0,
         "critic_verdict": {},
         "unresolved_violations": [],
@@ -1625,23 +1472,16 @@ if new_query:
 
     with st.spinner("🧠 Supervisor → specialists → itinerary → quality gate..."):
         try:
-            result = asyncio.run(
-                run_graph(
-                    input_state,
-                    config,
-                )
-            )
-
+            result = asyncio.run(run_graph(input_state, config))
         except Exception as exc:
             st.error("Something went wrong while planning your trip.")
-
-            st.exception(exc)
-
+            with st.expander("Show error details"):
+                st.exception(exc)
+            st.caption("You can adjust your request and try again below.")
             result = None
 
     if result is not None:
         st.session_state.latest_result = result
-
         st.session_state.waiting_for_approval = "__interrupt__" in result
 
 
@@ -1653,6 +1493,26 @@ result = st.session_state.get("latest_result")
 
 
 # ============================================================
+# EMPTY STATE (no trip planned in this thread yet)
+# ============================================================
+
+if not result:
+    render_html(
+        """
+<div class="empty-state">
+    <div class="empty-state-icon">🧭</div>
+    <div class="empty-state-title">No trip planned yet</div>
+    <div class="empty-state-sub">
+        Type a request below — destination, dates, budget, and any
+        preferences — and the supervisor will route it to the
+        specialists it needs.
+    </div>
+</div>
+"""
+    )
+
+
+# ============================================================
 # SUPERVISOR PLAN
 # ============================================================
 
@@ -1661,23 +1521,13 @@ if result:
 
     section_label("Supervisor Plan")
 
-    reasoning = result.get(
-        "supervisor_reasoning",
-        "Supervisor completed routing.",
-    )
+    reasoning = result.get("supervisor_reasoning", "Supervisor completed routing.")
 
     render_html(
         f"""
 <div class="reasoning-box">
-
-    <div class="reasoning-eyebrow">
-        Routing Note
-    </div>
-
-    <div class="reasoning-text">
-        {safe_multiline_html(reasoning)}
-    </div>
-
+    <div class="reasoning-eyebrow">Routing Note</div>
+    <div class="reasoning-text">{safe_multiline_html(reasoning)}</div>
 </div>
 """
     )
@@ -1689,112 +1539,38 @@ if result:
     section_label("Agent Execution")
 
     cols = st.columns(len(AGENT_ORDER))
-
     current_iteration = get_iteration(result)
+    is_replan = bool(result.get("is_replan", False))
 
-    is_replan = bool(
-        result.get(
-            "is_replan",
-            False,
-        )
-    )
-
-    for col, index, key in zip(
-        cols,
-        range(len(AGENT_ORDER)),
-        AGENT_ORDER,
-    ):
+    for col, index, key in zip(cols, range(len(AGENT_ORDER)), AGENT_ORDER):
         meta = AGENT_META[key]
-
         is_selected = key in selected_agents
-
-        content = result.get(
-            RESULT_KEY_FOR_AGENT[key],
-            "",
-        )
-
+        content = result.get(RESULT_KEY_FOR_AGENT[key], "")
         has_output = bool(content)
 
         if not is_selected:
-            status_text = "SKIPPED"
-            status_class = "off"
-            card_class = "inactive"
-
+            status_text, status_class, card_class = "SKIPPED", "off", "inactive"
         elif has_output and is_replan:
-            status_text = "REPLANNED"
-            status_class = "warn"
-            card_class = "replanned"
-
+            status_text, status_class, card_class = "REPLANNED", "warn", "replanned"
         elif has_output:
-            status_text = "COMPLETED"
-            status_class = "on"
-            card_class = "active"
-
+            status_text, status_class, card_class = "COMPLETED", "on", "active"
         else:
-            status_text = "SELECTED"
-            status_class = "on"
-            card_class = "active"
-
-        bar_widths = [
-            3,
-            1,
-            2,
-            1,
-            3,
-            1,
-            1,
-            2,
-            3,
-            1,
-            2,
-            1,
-        ]
-
-        barcode_bars = "".join(
-            f'<span style="width:{w}px;height:{6 + (i % 3) * 3}px;"></span>'
-            for i, w in enumerate(bar_widths)
-        )
+            status_text, status_class, card_class = "SELECTED", "on", "active"
 
         with col:
             render_html(
                 f"""
-<div class="agent-card {card_class}"
-     style="--accent:{meta["color"]};">
-
+<div class="agent-card {card_class}" style="--accent:{meta["color"]};">
     <div class="agent-card-top">
-
-        <span class="agent-gate">
-            GATE 0{index + 1}
-        </span>
-
-        <span class="agent-status {status_class}">
-            {status_text}
-        </span>
-
+        <span class="agent-gate">GATE 0{index + 1}</span>
+        <span class="agent-status {status_class}">{status_text}</span>
     </div>
-
     <div class="agent-card-body">
-
-        <span class="agent-icon">
-            {meta["icon"]}
-        </span>
-
-        <div class="agent-name">
-            {safe_html(meta["label"])}
-        </div>
-
-        <div class="agent-desc">
-            {safe_html(meta["desc"])}
-        </div>
-
+        <span class="agent-icon">{meta["icon"]}</span>
+        <div class="agent-name">{safe_html(meta["label"])}</div>
+        <div class="agent-desc">{safe_html(meta["desc"])}</div>
     </div>
-
-    <div class="agent-perf"></div>
-
-    <div class="agent-barcode">
-        {barcode_bars}
-    </div>
-
+    <div class="agent-perf-bar {status_class}"></div>
 </div>
 """
             )
@@ -1806,91 +1582,45 @@ if result:
     section_label("Quality Gate")
 
     verdict = get_critic_verdict(result)
-
     decision = get_decision(result)
-
     quality_score = verdict.get("quality_score")
-
     confidence = verdict.get("confidence")
-
-    degraded_mode = bool(
-        verdict.get(
-            "degraded_mode",
-            False,
-        )
-    )
-
+    degraded_mode = bool(verdict.get("degraded_mode", False))
     deterministic_passed = verdict.get("deterministic_checks_passed")
-
     llm_passed = verdict.get("llm_check_passed")
 
     decision_class = {
         "PASS": "quality-pass",
         "REVIEW": "quality-review",
         "REPLAN": "quality-replan",
-    }.get(
-        decision,
-        "quality-neutral",
-    )
+    }.get(decision, "quality-neutral")
 
     score_display = (
-        f"{quality_score:.0f}"
-        if isinstance(
-            quality_score,
-            (int, float),
-        )
-        else "—"
+        f"{quality_score:.0f}" if isinstance(quality_score, (int, float)) else "—"
     )
-
     confidence_display = (
-        f"{confidence:.0%}"
-        if isinstance(
-            confidence,
-            (int, float),
-        )
-        else "—"
+        f"{confidence:.0%}" if isinstance(confidence, (int, float)) else "—"
     )
 
     render_html(
         f"""
 <div class="quality-grid">
-
     <div class="quality-card">
-        <div class="quality-label">
-            Decision
-        </div>
-        <div class="quality-value {decision_class}">
-            {safe_html(decision)}
-        </div>
+        <div class="quality-label">Decision</div>
+        <div class="quality-value {decision_class}">{safe_html(decision)}</div>
     </div>
-
     <div class="quality-card">
-        <div class="quality-label">
-            Quality Score
-        </div>
-        <div class="quality-value">
-            {score_display}
-        </div>
+        <div class="quality-label">Quality Score</div>
+        <div class="quality-value">{score_display}</div>
     </div>
-
     <div class="quality-card">
-        <div class="quality-label">
-            Confidence
-        </div>
-        <div class="quality-value">
-            {confidence_display}
-        </div>
+        <div class="quality-label">Confidence</div>
+        <div class="quality-value">{confidence_display}</div>
     </div>
-
     <div class="quality-card">
-        <div class="quality-label">
-            Iteration
-        </div>
-        <div class="quality-value">
-            {current_iteration}/{3}
-        </div>
+        <div class="quality-label">Iteration</div>
+        <div class="quality-value">{current_iteration}/{MAX_ITERATIONS}</div>
     </div>
-
 </div>
 """
     )
@@ -1943,158 +1673,80 @@ if result:
 
         with score_col:
             dimensions = [
-                (
-                    "constraint",
-                    "Constraint",
-                ),
-                (
-                    "budget",
-                    "Budget",
-                ),
-                (
-                    "routing",
-                    "Routing",
-                ),
-                (
-                    "itinerary",
-                    "Itinerary",
-                ),
-                (
-                    "evidence",
-                    "Evidence",
-                ),
-                (
-                    "safety",
-                    "Safety",
-                ),
+                ("constraint", "Constraint"),
+                ("budget", "Budget"),
+                ("routing", "Routing"),
+                ("itinerary", "Itinerary"),
+                ("evidence", "Evidence"),
+                ("safety", "Safety"),
             ]
 
             render_html(
-                """
-<div class="panel">
-    <div class="panel-title">
-        Quality Dimensions
-    </div>
-"""
+                '<div class="panel"><div class="panel-title">Quality Dimensions</div>'
             )
 
             for key, label in dimensions:
                 value = scores.get(key)
-
-                if isinstance(
-                    value,
-                    (int, float),
-                ):
-                    value_display = f"{value:.0f}/100"
-
-                else:
-                    value_display = "—"
-
+                value_display = (
+                    f"{value:.0f}/100" if isinstance(value, (int, float)) else "—"
+                )
                 render_html(
                     f"""
 <div class="dimension-row">
-
-    <span class="dimension-name">
-        {safe_html(label)}
-    </span>
-
-    <span class="dimension-score">
-        {safe_html(value_display)}
-    </span>
-
+    <span class="dimension-name">{safe_html(label)}</span>
+    <span class="dimension-score">{safe_html(value_display)}</span>
 </div>
 """
                 )
 
-            render_html(
-                """
-</div>
-"""
-            )
+            render_html("</div>")
 
         with detail_col:
             violations = as_list(verdict.get("violations"))
-
             suggestions = as_list(verdict.get("suggestions"))
 
             if violations:
                 render_html(
-                    """
-<div class="panel">
-    <div class="panel-title">
-        Violations
-    </div>
-"""
+                    '<div class="panel"><div class="panel-title">Violations</div>'
                 )
-
                 for violation in violations:
                     render_html(
                         f"""
-<div style="padding:7px 18px;
-            color:#F08A6D;
-            font-size:0.82rem;
-            line-height:1.45;">
+<div style="padding:7px 18px; color:#F08A6D; font-size:0.82rem; line-height:1.45;">
     • {safe_html(violation)}
 </div>
 """
                     )
-
-                render_html(
-                    """
-</div>
-"""
-                )
+                render_html("</div>")
 
             if suggestions:
                 render_html(
-                    """
-<div class="panel">
-    <div class="panel-title">
-        Critic Suggestions
-    </div>
-"""
+                    '<div class="panel"><div class="panel-title">Critic Suggestions</div>'
                 )
-
                 for suggestion in suggestions:
                     render_html(
                         f"""
-<div style="padding:7px 18px;
-            color:#ECEEF3;
-            font-size:0.82rem;
-            line-height:1.45;">
+<div style="padding:7px 18px; color:#ECEEF3; font-size:0.82rem; line-height:1.45;">
     • {safe_html(suggestion)}
 </div>
 """
                     )
-
-                render_html(
-                    """
-</div>
-"""
-                )
+                render_html("</div>")
 
     # ========================================================
     # CRITIC REASONING
     # ========================================================
 
-    critic_reasoning = verdict.get(
-        "reasoning",
-        "",
-    )
+    critic_reasoning = verdict.get("reasoning", "")
 
     if critic_reasoning:
         render_html(
             f"""
 <div class="info-box">
-
     <strong>Critic assessment</strong><br><br>
-
-    <span style="color:#ECEEF3;
-                 font-size:0.84rem;
-                 line-height:1.55;">
+    <span style="color:#ECEEF3; font-size:0.84rem; line-height:1.55;">
         {safe_multiline_html(critic_reasoning)}
     </span>
-
 </div>
 """
         )
@@ -2113,16 +1765,11 @@ if result:
         responsible_labels = [
             AGENT_META[agent]["label"] for agent in responsible_agents
         ]
-
         render_html(
             f"""
-<div style="margin-top:10px;
-            color:#838C9E;
-            font-size:0.76rem;">
+<div style="margin-top:10px; color:#838C9E; font-size:0.76rem;">
     Replanning responsibility:
-    <strong style="color:#C9A24B;">
-        {safe_html(", ".join(responsible_labels))}
-    </strong>
+    <strong style="color:#C9A24B;">{safe_html(", ".join(responsible_labels))}</strong>
 </div>
 """
         )
@@ -2144,47 +1791,27 @@ if result:
 
         for index, key in enumerate(output_agents):
             meta = AGENT_META[key]
-
-            content = result.get(
-                RESULT_KEY_FOR_AGENT[key],
-                "",
-            )
+            content = result.get(RESULT_KEY_FOR_AGENT[key], "")
 
             if content:
-                body = safe_multiline_html(content)
-
+                # format_agent_content handles str / dict / list uniformly,
+                # so structured API output (e.g. weather_agent) renders as
+                # a readable key/value list instead of a raw dict/JSON dump.
+                body = format_agent_content(content)
             else:
-                body = (
-                    '<span style="color:#838C9E;'
-                    'font-size:0.85rem;">'
-                    "No output yet."
-                    "</span>"
-                )
+                body = '<span style="color:#838C9E; font-size:0.85rem;">No output yet.</span>'
 
             with out_cols[index % 2]:
                 render_html(
                     f"""
 <div class="panel">
-
-    <div class="panel-title">
-        {meta["icon"]}
-        {safe_html(meta["label"])}
-    </div>
-
-    <div style="padding:0 18px;
-                color:var(--text);
-                font-size:0.9rem;
-                line-height:1.6;
-                overflow-wrap:anywhere;">
-
+    <div class="panel-title">{meta["icon"]} {safe_html(meta["label"])}</div>
+    <div style="padding:0 18px; color:var(--text); font-size:0.9rem; line-height:1.6; overflow-wrap:anywhere;">
         {body}
-
     </div>
-
 </div>
 """
                 )
-
     else:
         st.caption("No specialist agents were selected.")
 
@@ -2197,65 +1824,34 @@ if result:
     draft = ""
 
     if "__interrupt__" in result:
-        interrupts = result.get(
-            "__interrupt__",
-            [],
-        )
-
+        interrupts = result.get("__interrupt__", [])
         if interrupts:
             interrupt_value = interrupts[0].value
-
-            if isinstance(
-                interrupt_value,
-                dict,
-            ):
-                draft = interrupt_value.get(
-                    "draft_itinerary",
-                    "",
-                )
-
+            if isinstance(interrupt_value, dict):
+                draft = interrupt_value.get("draft_itinerary", "")
     else:
-        draft = result.get(
-            "itinerary",
-            "",
-        )
+        draft = result.get("itinerary", "")
 
     if draft:
         stamp = (
             "AWAITING APPROVAL"
-            if st.session_state.get(
-                "waiting_for_approval",
-                False,
-            )
+            if st.session_state.get("waiting_for_approval", False)
             else "DRAFT"
         )
 
         render_html(
             f"""
 <div class="parchment">
-
     <div class="parchment-header">
-
-        <span class="parchment-title">
-            Working Draft
-        </span>
-
-        <span class="parchment-stamp">
-            {safe_html(stamp)}
-        </span>
-
+        <span class="parchment-title">Working Draft</span>
+        <span class="parchment-stamp">{safe_html(stamp)}</span>
     </div>
-
-    <div style="white-space:pre-wrap;
-                line-height:1.65;
-                color:var(--parchment-ink);">
-        {safe_multiline_html(draft)}
+    <div>
+        {render_markdown_html(draft)}
     </div>
-
 </div>
 """
         )
-
     else:
         st.info("The itinerary has not been generated yet.")
 
@@ -2264,10 +1860,7 @@ if result:
 # HUMAN APPROVAL
 # ============================================================
 
-if st.session_state.get(
-    "waiting_for_approval",
-    False,
-):
+if st.session_state.get("waiting_for_approval", False):
     st.divider()
 
     section_label("Human Approval")
@@ -2276,60 +1869,37 @@ if st.session_state.get(
 
     if decision == "REVIEW":
         st.warning("The quality gate recommends human review before finalization.")
-
     elif decision == "REPLAN":
         st.warning("The planner has requested another planning iteration.")
-
     else:
         st.info("The planner is waiting for your approval.")
 
     approved = st.radio(
-        "Approve this draft?",
-        [
-            "Yes",
-            "No, revise it",
-        ],
-        horizontal=True,
+        "Approve this draft?", ["Yes", "No, revise it"], horizontal=True
     )
 
     feedback = st.text_area(
         "Feedback",
-        placeholder=("Example: Reduce hotel cost and add more cultural activities."),
+        placeholder="Example: Reduce hotel cost and add more cultural activities.",
         disabled=approved == "Yes",
     )
 
-    if st.button(
-        "✅ Submit Approval",
-        type="primary",
-    ):
+    if st.button("✅ Submit Approval", type="primary"):
         with st.spinner("Finalizing the travel plan..."):
             try:
                 resume_command = Command(
-                    resume={
-                        "approved": (approved == "Yes"),
-                        "feedback": feedback,
-                    }
+                    resume={"approved": (approved == "Yes"), "feedback": feedback}
                 )
-
-                final_result = asyncio.run(
-                    run_graph(
-                        resume_command,
-                        config,
-                    )
-                )
-
+                final_result = asyncio.run(run_graph(resume_command, config))
             except Exception as exc:
                 st.error("Something went wrong while finalizing the plan.")
-
-                st.exception(exc)
-
+                with st.expander("Show error details"):
+                    st.exception(exc)
                 final_result = None
 
         if final_result is not None:
             st.session_state.latest_result = final_result
-
             st.session_state.waiting_for_approval = "__interrupt__" in final_result
-
             st.rerun()
 
 
@@ -2344,56 +1914,30 @@ if final_result and final_result.get("final_response"):
 
     section_label("Final Travel Plan")
 
-    final_response = final_result.get(
-        "final_response",
-        "",
-    )
-
+    final_response = final_result.get("final_response", "")
     final_verdict = get_critic_verdict(final_result)
-
     final_decision = get_decision(final_result)
-
-    human_approved = final_result.get(
-        "approved",
-        False,
-    )
+    human_approved = final_result.get("approved", False)
 
     if human_approved:
         final_stamp = "APPROVED"
-
     elif final_decision == "REVIEW":
         final_stamp = "REVIEWED"
-
     else:
         final_stamp = "PLAN"
 
     render_html(
         f"""
 <div class="parchment">
-
     <div class="parchment-header">
-
         <span class="parchment-title">
-            Final Travel Plan
-            &nbsp;·&nbsp;
-            {safe_html(st.session_state.thread_id)}
+            Final Travel Plan &nbsp;·&nbsp; {safe_html(st.session_state.thread_id)}
         </span>
-
-        <span class="parchment-stamp">
-            {safe_html(final_stamp)}
-        </span>
-
+        <span class="parchment-stamp">{safe_html(final_stamp)}</span>
     </div>
-
-    <div style="white-space:pre-wrap;
-                line-height:1.65;
-                color:var(--parchment-ink);
-                overflow-wrap:anywhere;">
-
-        {safe_multiline_html(final_response)}
-
+    <div>
+        {render_markdown_html(final_response)}
     </div>
-
 </div>
 """
     )
@@ -2403,39 +1947,23 @@ if final_result and final_result.get("final_response"):
     # ========================================================
 
     final_quality = final_verdict.get("quality_score")
-
     final_confidence = final_verdict.get("confidence")
-
     final_iteration = get_iteration(final_result)
 
     summary_parts = [
         f"Decision: {final_decision}",
-        (
-            f"Quality: {final_quality:.0f}/100"
-            if isinstance(
-                final_quality,
-                (int, float),
-            )
-            else "Quality: N/A"
-        ),
-        (
-            f"Confidence: {final_confidence:.0%}"
-            if isinstance(
-                final_confidence,
-                (int, float),
-            )
-            else "Confidence: N/A"
-        ),
+        f"Quality: {final_quality:.0f}/100"
+        if isinstance(final_quality, (int, float))
+        else "Quality: N/A",
+        f"Confidence: {final_confidence:.0%}"
+        if isinstance(final_confidence, (int, float))
+        else "Confidence: N/A",
         f"Iterations: {final_iteration}",
     ]
 
     render_html(
         f"""
-<div style="margin-top:12px;
-            color:#838C9E;
-            font-family:'IBM Plex Mono',monospace;
-            font-size:0.68rem;
-            letter-spacing:0.04em;">
+<div style="margin-top:12px; color:#838C9E; font-family:'IBM Plex Mono',monospace; font-size:0.68rem; letter-spacing:0.04em;">
     {safe_html(" · ".join(summary_parts))}
 </div>
 """
@@ -2449,10 +1977,7 @@ if final_result and final_result.get("final_response"):
         result=final_result,
         user_id=user_id,
         thread_id=st.session_state.thread_id,
-        user_query=st.session_state.get(
-            "user_query",
-            "",
-        ),
+        user_query=st.session_state.get("user_query", ""),
     )
 
     dl_col, _ = st.columns([1, 4])
@@ -2461,7 +1986,7 @@ if final_result and final_result.get("final_response"):
         st.download_button(
             label="📄 Download PDF",
             data=pdf_bytes,
-            file_name=(f"travel_plan_{st.session_state.thread_id}.pdf"),
+            file_name=f"travel_plan_{st.session_state.thread_id}.pdf",
             mime="application/pdf",
             use_container_width=True,
         )
