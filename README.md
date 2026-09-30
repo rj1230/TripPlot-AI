@@ -4,6 +4,8 @@
 
 TripPlot extends a basic multi-agent travel planner into a production-pattern architecture. A **Supervisor Agent** orchestrates specialized sub-agents over **MCP (Model Context Protocol)** servers, a **Critic-Revise Harness** improves the itinerary before anyone sees it, **Guardrails** validate inputs and outputs, and a **Human-in-the-Loop** checkpoint pauses execution before any consequential action is confirmed.
 
+🔗 **Live demo:** [tripplot-ai-frontend.streamlit.app](https://rj1230-tripplot-ai-frontend-6cg2mj.streamlit.app/)
+
 ---
 
 ## ✨ Key Features
@@ -22,10 +24,12 @@ TripPlot extends a basic multi-agent travel planner into a production-pattern ar
 ```mermaid
 flowchart TD
     A[User Request] --> B[Supervisor Agent<br/>LangGraph]
-    B --> C[Flight Agent<br/>MCP Server]
-    B --> D[Hotel Agent<br/>MCP Server]
-    B --> E[Itinerary Agent<br/>MCP Server]
+    B --> C[Flight Agent<br/>AviationStack MCP]
+    B --> W[Weather Agent<br/>Weather MCP]
+    B --> D[Hotel Agent]
+    B --> E[Itinerary Agent]
     C --> F[Draft Itinerary]
+    W --> F
     D --> F
     E --> F
     F --> R[Critic-Revise Harness<br/>max 3 iterations]
@@ -36,7 +40,7 @@ flowchart TD
 ```
 
 1. **Request** — the user submits a travel request
-2. **Supervisor** — routes it to the relevant sub-agents (Flight, Hotel, Itinerary), each an MCP server
+2. **Supervisor** — routes it to the relevant sub-agents (Flight, Weather, Hotel, Itinerary); flight and weather data come through MCP servers
 3. **Draft** — the sub-agents produce a draft itinerary
 4. **Critic-Revise** — the draft is scored and revised for up to 3 rounds, or until it passes
 5. **Guardrails** — the final output is validated
@@ -54,9 +58,59 @@ flowchart TD
 | Critic-Revise harness | LangGraph conditional edges (bounded loop, max 3 iterations) |
 | LLM | Groq (configurable) |
 | Guardrails | Guardrails AI / NeMo Guardrails |
-| External data | Tavily (search), OpenWeather (weather) |
+| External data | AviationStack (flights), Tavily (search), OpenWeather (weather) |
 | Persistence / checkpointing | Postgres |
 | Frontend | Streamlit |
+
+---
+
+## 📂 Project Structure
+
+```
+TripPlot-AI/
+├── agents.py                # Agent definitions
+├── graph.py                 # LangGraph workflow
+├── critic.py                # Critic agent for the Critic-Revise Harness
+├── state.py                 # Shared graph state
+├── mcp_client.py            # MCP client
+├── weather_mcp_server.py    # Weather MCP server
+├── aviationstack-mcp        # AviationStack flight-data MCP server
+├── tools/
+├── config.py                # Settings and API keys
+├── frontend.py              # Streamlit app
+├── main.py                  # Entrypoint
+├── test.py
+├── pyproject.toml
+├── uv.lock
+├── requirements.txt
+└── .python-version
+```
+
+---
+
+## 🚀 Quick Start
+
+```bash
+# 1. Clone and install
+git clone https://github.com/rj1230/TripPlot-AI.git
+cd TripPlot-AI
+pip install -r requirements.txt
+
+# 2. Add your API keys to a .env file (see the table below)
+
+# 3. Launch the Streamlit app
+streamlit run frontend.py
+```
+
+**Services you'll need keys for**
+
+| Service | Used for |
+|---|---|
+| Groq | LLM |
+| Tavily | Web search |
+| OpenWeather | Weather data |
+| AviationStack | Flight data |
+| Postgres | Persistence and checkpointing |
 
 ---
 
