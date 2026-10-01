@@ -14,7 +14,7 @@ TripPlot extends a basic multi-agent travel planner into a production-pattern ar
 - **Critic-Revise Harness** — scores and refines the itinerary across up to 3 bounded iterations before it reaches the user
 - **Guardrails** — inputs and outputs are validated, not trusted blindly
 - **Human approval gates** — the graph pauses for confirmation before committing to an action
-- **Modular tool access via MCP** — sub-agents call flights, hotels, and weather through standardized MCP servers, not hardcoded API calls
+- **Modular tool access via MCP** — flight and weather data come through standardized MCP servers, not hardcoded API calls
 - **Auditable decisions** — every hop, including each critique and revision round, is traceable via LangGraph state
 
 ---
